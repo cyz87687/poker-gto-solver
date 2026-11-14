@@ -274,7 +274,7 @@ function renderPaste(w) {
   <div class="small muted" style="margin-top:6px">格式：一行一街；<span class="mono">[...]</span> 为公共牌；动作后数值为 <b>BB 绝对值</b>；支持 <span class="mono">Pot=</span> 与百分比下注（需同时提供 Pot=）。解析失败会定位到行号。</div>
   <div class="row" style="margin-top:10px"><button class="btn primary" data-act="parsePaste">解析并预览</button><button class="btn" data-act="pasteToWizard">转为向导录入</button></div>
   ${w.parseInfo ? renderParseInfo(w.parseInfo) : ''}</div>
-  <div class="notice">导入后仍可在向导中调整对手范围、下注尺度与求解模式；学徒模式下请勿录入任何真实资金相关内容。</div>`;
+  <div class="notice">导入后仍可在向导中调整对手范围、下注尺度与求解模式。</div>`;
 }
 function renderParseInfo(info) {
   if (info.errors.length) return `<div class="notice danger" style="margin-top:12px"><b>解析失败（${info.errors.length} 处）</b><br>${info.errors.map(e => `第 ${e.line} 行：${esc(e.msg)}`).join('<br>')}<br><span class="tiny">可点击「转为向导录入」手动填写。</span></div>`;
