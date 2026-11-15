@@ -3,7 +3,8 @@ import { RANKS, SUITS, SUIT_SYM, cardStr, cardLabel, isRed, parseCardList, parse
 import {
   STREETS, POS6, POS9, ACTION_TYPES, BUILTIN_TAGS, ARCHETYPES, positionsFor, makeId, defaultHand,
   formatAction, parseHH, validateHand, deriveState, heroDecisionIndices, serializeHH, handClass, handProfitBB,
-  parseActionText, normalizeActionAmounts, solveReadiness, firstToActPostflop
+  parseActionText, normalizeActionAmounts, solveReadiness, firstToActPostflop,
+  stageFromBoard, stageBoardCount
 } from './hand.js';
 import {
   initDB, state, commit, persist, saveDraft, clearDraft, upsertSession, removeSession, upsertHand, removeHand,
@@ -23,7 +24,7 @@ const money = v => (state().settings.currency || '¥') + fmt(v);
 const today = () => new Date().toISOString().slice(0, 10);
 
 let wizard = null;
-let ui = { wizTab: 'wizard', resTab: null, period: '30d', filters: { sign: 'all', type: 'all', q: '' }, lib: { q: '', tag: '', fav: false }, act: { street: null, actor: null, bulk: false } };
+let ui = { wizTab: 'wizard', resTab: null, period: 'all', filters: { sign: 'all', type: 'all', q: '' }, lib: { q: '', tag: '', fav: false }, act: { street: null, actor: null, bulk: false } };
 let pendingPick = null;
 let previewResult = null;
 let toastTimer = null;
@@ -153,24 +154,34 @@ function buildSolveReq(h, decisionIndex) {
   const act = (h.actions || [])[decisionIndex];
   const pot = h.potOverrideBB != null && Number.isFinite(Number(h.potOverrideBB)) ? Number(h.potOverrideBB) : st.pot;
   const stack = h.stackOverrideBB != null && Number.isFinite(Number(h.stackOverrideBB)) ? Number(h.stackOverrideBB) : st.stack;
+  const stage = (wizard && wizard.stage) || stageFromBoard((h.board || []).length);
+  const need = stageBoardCount(stage);
+  const board = need === 0 ? [] : (h.board || []).filter(c => c != null).slice(0, need);
+  // 决策点所在街与当前阶段不一致时，视为「新街起始局面」：无待跟注额，按位置决定谁先动
+  const sameStreet = st.street === stage;
+  const facingBet = sameStreet ? st.facingBet : (stage === 'PREFLOP' ? st.facingBet : 0);
+  const oppChecked = sameStreet ? st.oppChecked : (stage === 'PREFLOP' ? false : !st.heroOOP);
   return {
-    board: st.board, heroCards: h.heroCards || [], villainCards: h.villainCards || [], deadCards: h.deadCards || [],
+    board, heroCards: h.heroCards || [], villainCards: h.villainCards || [], deadCards: h.deadCards || [],
     heroRange: h.ranges.hero, villainRange: h.ranges.villain,
-    pot, stack, facingBet: st.facingBet, heroOOP: st.heroOOP, oppChecked: st.oppChecked,
+    pot, stack, facingBet, heroOOP: st.heroOOP, oppChecked,
     sizes: h.sizes, allowCheckRaise: h.allowCheckRaise, preset: h.preset,
     mode: h.mode, archetype: h.archetype, intensity: h.intensity,
     userAction: act ? { type: act.type, amountBB: act.amountBB } : null,
-    decisionNode: `${st.street}|${h.positions.hero}|${st.facingBet > 0 ? 'vs_bet' : 'vs_check'}`,
-    decisionIndex
+    decisionNode: `${stage}|${h.positions.hero}|${facingBet > 0 ? 'vs_bet' : 'vs_check'}`,
+    decisionIndex, stage
   };
 }
 function selectedDecisionIndex(h) {
-  const idxs = heroDecisionIndices(h);
-  if (!idxs.length) return (h.actions || []).length;
-  return wizard && idxs.includes(wizard.decisionIndex) ? wizard.decisionIndex : idxs[idxs.length - 1];
+  const stage = (wizard && wizard.stage) || stageFromBoard((h.board || []).length);
+  const si = STREETS.indexOf(stage);
+  const acts = h.actions || [];
+  const onStage = heroDecisionIndices(h).filter(i => STREETS.indexOf(String(acts[i].street).toUpperCase()) === si);
+  if (!onStage.length) return acts.length; // 该街尚未行动 → 复盘「还没行动的这一步」
+  return wizard && onStage.includes(wizard.decisionIndex) ? wizard.decisionIndex : onStage[onStage.length - 1];
 }
 function submitSolve(h, decisionIndex) {
-  const rd = solveReadiness(h);
+  const rd = solveReadiness(h, wizard && wizard.stage);
   if (!rd.ready) { openReadiness(rd); return; }
   const v = validateHand(h);
   if (!v.ok) { openReadiness(rd); return; }
@@ -233,7 +244,7 @@ function renderDashboard() {
   <div class="card"><div class="card-title"><h2>最近对局</h2><button class="btn sm" data-act="go" data-v="sessions">全部</button></div>
     ${recent.length ? `<div class="table-wrap"><table><thead><tr><th>日期</th><th>名称</th><th>盲注</th><th>净盈亏</th></tr></thead><tbody>${recent.map(x => `<tr><td>${esc(x.date)}</td><td>${esc(x.name)}</td><td>${esc(x.stakes?.sb)}/${esc(x.stakes?.bb)}</td><td class="${pnlCls(sessionNet(x))}">${signed(sessionNet(x))}</td></tr>`).join('')}</tbody></table></div>` : '<div class="empty">还没有对局记录，先创建一场吧</div>'}
   </div>
-  <div class="notice info">求解范围：<b>仅翻后单挑底池</b>（公共牌 3–5 张）；不支持翻前求解、3 人及以上底池、ICM 与含抽水计算。结果为牌力分档抽象下的近似均衡解。</div>`;
+  <div class="notice info">求解范围：<b>翻前近似</b>（无需公共牌）与<b>翻后单挑</b>（公共牌 3–5 张）；不支持 3 人及以上底池、ICM 与含抽水计算。结果为牌力分档抽象下的近似解。</div>`;
 }
 function kpi(label, value, cls = '') {
   return `<div class="kpi"><div class="label">${esc(label)}</div><div class="value ${cls}">${esc(value)}</div></div>`;
@@ -243,7 +254,12 @@ function kpi(label, value, cls = '') {
 function ensureWizard() {
   if (wizard) return wizard;
   const draft = state().draft;
-  wizard = { step: 1, hand: draft || defaultHand(), decisionIndex: null, wizTab: ui.wizTab, pasteText: '', parseInfo: null };
+  const hand = draft || defaultHand();
+  wizard = {
+    step: 1, hand, decisionIndex: null,
+    stage: stageFromBoard((hand.board || []).length), paramsOpen: false,
+    wizTab: ui.wizTab, pasteText: '', parseInfo: null
+  };
   return wizard;
 }
 const HH_EXAMPLE = `# PokerGTO HH v1
@@ -260,7 +276,7 @@ function renderNew() {
   const w = ensureWizard();
   const h = w.hand;
   app.innerHTML = `
-  <div class="page-head"><div><h1>新建一手复盘</h1><p class="sub">向导录入 / 牌谱粘贴导入 · V1.0 仅翻后单挑可求解</p></div>
+  <div class="page-head"><div><h1>新建一手复盘</h1><p class="sub">按街推进：默认翻前（无需公共牌）· 下一步翻后再选公共牌</p></div>
     <button class="btn sm" data-act="resetWizard">清空重填</button></div>
   <div class="tabs">
     <button class="${w.wizTab === 'wizard' ? 'on' : ''}" data-act="wizTab" data-v="wizard">分步向导</button>
@@ -287,36 +303,33 @@ function renderParseInfo(info) {
 }
 function renderWizard(w) {
   const h = w.hand;
-  const steps = ['基础与手牌', '行动流', '范围与参数', '校验并求解'];
+  const steps = ['牌局与手牌', '行动流与解算'];
   const v = validateHand(h);
   const di = selectedDecisionIndex(h);
-  const rd = solveReadiness(h);
-  let body = '';
-  if (w.step === 1) body = wizardStep1(h);
-  else if (w.step === 2) body = wizardStep2(h, di, v);
-  else if (w.step === 3) body = wizardStep3(h);
-  else body = wizardStep4(h, di, v);
+  const rd = solveReadiness(h, w.stage);
+  const body = w.step === 1 ? wizardStep1(h) : wizardStep2(h, di, v, rd);
   const stateTip = rd.ready
     ? '<span class="ready-ok">✓ 已满足解算条件</span>'
-    : `<span class="ready-no">✕ ${esc(firstBlocking(rd))}</span>`;
+    : `<span class="ready-no">✕ 待补齐：${esc(firstBlocking(rd))}</span>`;
   return `<div class="card tight"><div class="stepper">${steps.map((s, i) => `${i ? '<span class="line"></span>' : ''}<span class="s ${w.step === i + 1 ? 'on' : ''}"><span class="n">${i + 1}</span>${s}</span>`).join('')}</div></div>
   ${body}
   <div class="wiz-foot">
-    <button class="btn" data-act="wizStep" data-v="${Math.max(1, w.step - 1)}" ${w.step === 1 ? 'disabled' : ''}>上一步</button>
+    ${w.step > 1 ? '<button class="btn" data-act="wizStep" data-v="1">上一步</button>' : '<span></span>'}
     <div class="foot-state">${stateTip}<span class="tiny muted sep">·</span><span class="tiny muted">草稿自动保存</span></div>
     <div class="row">
-      ${w.step < 4 ? `<button class="btn" data-act="wizStep" data-v="${w.step + 1}">${w.step === 2 ? '范围与参数' : '下一步'}</button>` : ''}
-      ${w.step >= 2 ? `<button class="btn primary" data-act="beginSolve">开始解算 →</button>` : ''}
+      ${w.step < 2 ? '<button class="btn" data-act="wizStep" data-v="2">下一步：行动流 →</button>' : ''}
+      <button class="btn primary" data-act="beginSolve">开始解算 →</button>
     </div>
   </div>`;
 }
-function cardSlot(c, kind, idx) {
+function cardSlot(c, kind, idx, pending) {
   const label = c != null ? cardLabel(c) : '+';
-  return `<button class="card-slot ${c != null && isRed(c) ? 'red' : ''}" data-act="pickCard" data-kind="${kind}" data-idx="${idx}" title="点击选择">${esc(label)}</button>`;
+  return `<button class="card-slot ${c != null && isRed(c) ? 'red' : ''} ${pending ? 'pending' : ''}" data-act="pickCard" data-kind="${kind}" data-idx="${idx}" title="${pending ? '请按顺序先选择前面的牌' : '点击选择'}">${esc(label)}</button>`;
 }
 function cardRowHtml(cards, kind, n) {
   const arr = (cards || []).slice(0, n);
-  return `<div class="card-row">${Array.from({ length: n }, (_, i) => cardSlot(arr[i], kind, i)).join('')}
+  const len = (cards || []).filter(c => c != null).length;
+  return `<div class="card-row">${Array.from({ length: n }, (_, i) => cardSlot(arr[i], kind, i, arr[i] == null && i > len)).join('')}
     ${(cards || []).length ? `<button class="btn sm" data-act="clearCards" data-kind="${kind}">清空</button>` : ''}</div>`;
 }
 function wizardStep1(h) {
@@ -329,14 +342,13 @@ function wizardStep1(h) {
     <label class="field"><span>Hero 位置</span><select data-bind="positions.hero" data-refresh="1">${pos.map(p => `<option value="${p}" ${h.positions.hero === p ? 'selected' : ''}>${p}</option>`).join('')}</select></label>
     <label class="field"><span>对手位置</span><select data-bind="positions.villain">${pos.map(p => `<option value="${p}" ${h.positions.villain === p ? 'selected' : ''}>${p}</option>`).join('')}</select></label>
   </div><div class="tiny muted" style="margin-top:6px">游戏类型：NLHE（V1.0 固定）；BB 为求解基准单位。</div></div>
-  <div class="card"><h2>② 手牌与公共牌</h2>
+  <div class="card"><h2>② 手牌</h2>
     <div class="small muted">Hero 手牌（点击格子选择花色 + 牌点）</div>${cardRowHtml(h.heroCards, 'hero', 2)}
-    <div class="small muted" style="margin-top:8px">公共牌（翻牌 3 张起，可追加转牌 / 河牌）</div>${cardRowHtml(h.board, 'board', 5)}
     <div class="small muted" style="margin-top:8px">对手手牌（可选，摊牌已知时填写）</div>${cardRowHtml(h.villainCards, 'villain', 2)}
     <label class="field" style="margin-top:8px"><span>死牌 Dead Cards（可选，如 As Kd）</span><input type="text" data-bind="deadText" value="${esc((h.deadCards || []).map(cardStr).join(' '))}" placeholder="已知弃牌，空格分隔"></label>
     <label class="field" style="margin-top:8px"><span>摊牌结果</span><select data-bind="result"><option value="" ${!h.result ? 'selected' : ''}>未录入</option><option value="hero" ${h.result === 'hero' ? 'selected' : ''}>我方赢</option><option value="villain" ${h.result === 'villain' ? 'selected' : ''}>对方赢</option><option value="split" ${h.result === 'split' ? 'selected' : ''}>平分底池</option></select></label>
   </div>
-  <div class="notice info">V1.0 仅支持<b>翻后单挑</b>求解：公共牌需 3–5 张，且翻牌后只有 Hero 与 Villain 两家行动。多人底牌谱可录入归档，但不输出求解结果。</div>`;
+  <div class="notice info">默认从<b>翻前</b>开始：无需选公共牌，录完手牌与翻前行动即可解算。点第 2 步的「下一步：翻牌」后，才需要选择 3 张公共牌；转牌 / 河牌逐街追加。翻后仅支持 Hero 与对手两家。</div>`;
 }
 /* ---------------- 行动流：可视化行动选择器 ---------------- */
 const ACTION_LABEL = { FOLD: '弃牌', CHECK: '过牌', CALL: '跟注', BET: '下注', RAISE_TO: '加注至', ALLIN: '全下' };
@@ -355,6 +367,7 @@ function actorKey(h, a) {
 }
 /** 当前选中的街：用户切换优先，否则继承最后一条动作 */
 function actStreet(h) {
+  if (wizard && wizard.stage) return wizard.stage;
   const acts = h.actions || [];
   return ui.act.street || (acts.length ? String(acts[acts.length - 1].street).toUpperCase() : 'PREFLOP');
 }
@@ -488,12 +501,13 @@ function tableHtml(h, street, actor, live) {
       ${active ? '<div class="seat-act">行动中</div>' : ''}
     </div>`;
   }).join('');
-  const board = (h.board || []).map(c => `<span class="mini-card ${isRed(c) ? 'red' : ''}">${cardLabel(c)}</span>`).join('');
+  const boardN = stageBoardCount(street);
+  const board = boardN === 0 ? '' : (h.board || []).filter(c => c != null).slice(0, boardN).map(c => `<span class="mini-card ${isRed(c) ? 'red' : ''}">${cardLabel(c)}</span>`).join('');
   return `<div class="table-wrap-v">
     <div class="felt">${seats}
       <div class="felt-center">
         <div class="pot"><span>底池</span><b>${fmt(live.pot ?? 0, 1)}</b><span>BB</span></div>
-        <div class="felt-board">${board || '<span class="tiny muted">未选公共牌</span>'}</div>
+        <div class="felt-board">${board || `<span class="tiny muted">${boardN === 0 ? '翻前 · 暂无公共牌' : '未选公共牌'}</span>`}</div>
         <div class="felt-street">${STREET_NAME[street] || street}</div>
       </div>
     </div>
@@ -565,23 +579,41 @@ function firstBlocking(rd) {
   return b ? b.label + (b.hint ? `（${b.hint}）` : '') : '';
 }
 
-function wizardStep2(h, di, v) {
+function wizardStep2(h, di, v, rd) {
   const idxs = heroDecisionIndices(h);
   const street = actStreet(h);
   const si = STREETS.indexOf(street);
   const acts = h.actions || [];
-  const lastSi = acts.length ? STREETS.indexOf(String(acts[acts.length - 1].street).toUpperCase()) : -1;
   const actor = nextActorFor(h, street);
   const live = liveFor(h, street).live;
   const toCall = Math.max(0, Number(live.toCall) || 0);
-  const rd = solveReadiness(h);
   const actorSideName = actorKey(h, actor) === 'HERO' ? 'Hero' : actorKey(h, actor) === 'VILLAIN' ? '对手' : '其他位置';
-  const streetChips = STREETS.map((st, i) => `<button class="chip ${st === street ? 'on' : ''}" data-act="setStreet" data-v="${st}" ${i < lastSi ? 'disabled title="街序不能回退"' : ''}>${STREET_NAME[st]}${st === street ? ' · 当前' : ''}</button>`).join('');
-  const nextSt = STREETS[Math.min(3, si + 1)];
+  const boardNeed = stageBoardCount(street);
+  const boardNow = (h.board || []).filter(c => c != null).length;
+  const stageNav = STREETS.map((st, i) => {
+    const need = stageBoardCount(st);
+    const done = i > 0 && boardNow >= need;
+    return `<button class="stage ${st === street ? 'on' : ''}" data-act="setStreet" data-v="${st}">
+      <b>${['①', '②', '③', '④'][i]} ${STREET_NAME[st]}</b>
+      <span>${need === 0 ? '无需公共牌' : `需 ${need} 张公共牌`}${done ? ' ✓' : ''}</span></button>`;
+  }).join('');
+  const nextSt = si < 3 ? STREETS[si + 1] : null;
+  const boardCard = boardNeed === 0 ? '' : `<div class="card stage-board-card">
+    <div class="card-title"><h2>${STREET_NAME[street]}公共牌</h2>
+      <span class="tiny ${boardNow >= boardNeed ? 'ready-ok' : 'ready-no'}">${boardNow >= boardNeed ? `✓ 已选齐 ${boardNeed} 张` : `还差 ${boardNeed - boardNow} 张`} · 点击 + 选择</span></div>
+    ${cardRowHtml(h.board, 'board', boardNeed)}
+    <div class="tiny muted" style="margin-top:6px">前一街已选的公共牌自动保留；翻前阶段不显示此区。</div>
+  </div>`;
 
   return `<div class="card"><div class="card-title"><h2>③ 选择行动</h2><span class="tiny muted">已录入 ${acts.length} 条 · 点卡片即录入</span></div>
     ${readinessStrip(rd)}
-    <div class="street-row"><div class="chips">${streetChips}<button class="chip sm" data-act="nextStreet" data-v="${nextSt}" ${si >= 3 ? 'disabled' : ''}>下一街 →</button></div></div>
+    <div class="stage-nav">${stageNav}</div>
+    ${boardCard}
+    <div class="stage-actions">
+      ${nextSt ? `<button class="btn primary" data-act="advanceStage">下一步：${STREET_NAME[nextSt]} →</button>` : '<span class="tiny muted">已到河牌，可直接解算</span>'}
+      <button class="btn sm" data-act="toggleParams">${wizard.paramsOpen ? '收起求解参数' : '求解参数（范围 / 尺度 / 模式）'}</button>
+      <span class="tiny muted">当前阶段：${STREET_NAME[street]}</span>
+    </div>
     <div class="turn-bar">
       <div class="turn-who"><span class="turn-label">下一位行动</span><b class="side-${actorKey(h, actor) === 'HERO' ? 'hero' : 'villain'}">${esc(actor)}</b><span class="tiny muted">${actorSideName}</span></div>
       <div class="turn-nums">
@@ -607,19 +639,20 @@ function wizardStep2(h, di, v) {
       <button class="btn sm" data-act="toggleBulk">${ui.act.bulk ? '收起批量录入' : '批量粘贴录入'}</button>
       <button class="btn sm" data-act="loadExampleActions">填充标准示例</button>
     </div>
-    ${ui.act.bulk ? `<div class="bulk-box"><div class="small muted">每行一条街，逗号分隔动作；支持中英文动作名，金额可省略（自动按状态机补齐）。公共牌请在第一步录入。</div>
+    ${ui.act.bulk ? `<div class="bulk-box"><div class="small muted">每行一条街，逗号分隔动作；支持中英文动作名，金额可省略（自动按状态机补齐）。公共牌请在对应街阶段录入。</div>
       <textarea id="bulkActions" rows="6" spellcheck="false" placeholder="Preflop: UTG fold, BTN raise 5, BB call 5&#10;Flop: BB check, BTN bet 3.3, BB call">${esc(wizard.bulkText || '')}</textarea>
       <div class="row" style="margin-top:8px"><button class="btn sm" data-act="bulkLoadExample">载入示例</button><button class="btn primary sm" data-act="bulkParse">解析并替换行动流</button></div>
       ${wizard.bulkInfo ? `<div class="${wizard.bulkInfo.ok ? 'notice info' : 'notice danger'}" style="margin-top:8px">${esc(wizard.bulkInfo.msg)}</div>` : ''}</div>` : ''}
   </div>
-  <div class="card"><h2>决策点</h2><div class="small muted">复盘的是「Hero 在该节点应该怎么打」。默认取最后一个 Hero 翻后动作；点下方标签可切换。</div>
-    <div class="row" style="margin-top:8px">${idxs.length ? idxs.map(i => `<button class="chip ${i === di ? 'on' : ''}" data-act="setDecision" data-v="${i}">#${i + 1} ${esc(formatAction(h.actions[i]))}</button>`).join('') : '<span class="small muted">尚未录入 Hero 翻后动作 · 若想复盘「还没行动的这一步」，可直接解算当前局面</span>'}</div>
+  <div class="card"><h2>决策点</h2><div class="small muted">复盘的是「Hero 在该节点应该怎么打」。默认取当前阶段最后一个 Hero 动作；该街尚未行动时直接解算当前局面。</div>
+    <div class="row" style="margin-top:8px">${idxs.length ? idxs.map(i => `<button class="chip ${i === di ? 'on' : ''}" data-act="setDecision" data-v="${i}">#${i + 1} ${esc(formatAction(h.actions[i]))}</button>`).join('') : '<span class="small muted">该阶段尚未录入 Hero 动作 · 可直接解算「还没行动的这一步」</span>'}</div>
   </div>
   <div class="card"><h2>状态校验</h2>
     ${v.errors.length ? `<div class="notice danger">${v.errors.map(e => esc(e.path + '：' + e.msg)).join('<br>')}</div>` : '<div class="notice info">行动流校验通过</div>'}
     ${v.warnings.length ? `<div class="notice" style="margin-top:8px">${v.warnings.map(esc).join('<br>')}</div>` : ''}
     <div class="small muted" style="margin-top:8px">当前局面：底池 ${fmt(live.pot ?? v.computedPotBB, 1)} BB · 待跟注 ${fmt(toCall, 1)} BB；行动流推算底池 ${fmt(v.computedPotBB, 1)} BB（含盲注）。</div>
-  </div>`;
+  </div>
+  ${wizard.paramsOpen ? wizardStep3(h) : ''}`;
 }
 
 /* ---------- 行动编辑弹窗 ---------- */
@@ -635,7 +668,7 @@ function openActionEditor(i) {
       : '<div class="tiny muted" style="margin-top:8px">该动作无需金额。</div>'}
     <div class="row" style="margin-top:12px">
       <button class="btn primary" data-act="saveAction" data-v="${i}">保存</button>
-      ${canDecision ? `<button class="btn" data-act="setDecision" data-v="${i}" data-close="1">设为决策点</button>` : '<span class="tiny muted">仅 Hero 的翻后动作可作决策点</span>'}
+      ${canDecision ? `<button class="btn" data-act="setDecision" data-v="${i}" data-close="1">设为决策点</button>` : '<span class="tiny muted">仅 Hero 在当前阶段的动作可作决策点</span>'}
       <button class="btn danger" data-act="delAction" data-v="${i}">删除</button>
       <button class="btn ghost" data-act="closeModal">取消</button>
     </div>`);
@@ -654,7 +687,7 @@ function openReadiness(rd) {
 }
 function beginSolve() {
   if (!wizard) return;
-  const rd = solveReadiness(wizard.hand);
+  const rd = solveReadiness(wizard.hand, wizard.stage);
   if (!rd.ready) { openReadiness(rd); return; }
   submitSolve(wizard.hand, selectedDecisionIndex(wizard.hand));
 }
@@ -663,7 +696,7 @@ function sizeChips(h) {
   return presets.map(([v, n]) => `<button class="chip ${h.sizes.includes(v) ? 'on' : ''}" data-act="toggleSize" data-v="${v}">${n}</button>`).join('');
 }
 function wizardStep3(h) {
-  return `<div class="card"><h2>④ 对手范围与求解参数</h2>
+  return `<div class="card"><h2>对手范围与求解参数</h2>
     <div class="grid g2">
       <label class="field"><span>Hero 范围模板</span><select data-range-preset="hero">${RANGE_PRESETS.map(p => `<option value="${p.id}" ${h.rangePresets.hero === p.id ? 'selected' : ''}>${esc(p.name)}</option>`).join('')}</select></label>
       <label class="field"><span>Villain 范围模板</span><select data-range-preset="villain">${RANGE_PRESETS.map(p => `<option value="${p.id}" ${h.rangePresets.villain === p.id ? 'selected' : ''}>${esc(p.name)}</option>`).join('')}</select></label>
@@ -702,30 +735,6 @@ function rangeGridHtml(matrix) {
   }
   return html + '</div></div>';
 }
-function wizardStep4(h, di, v) {
-  const st = deriveState(h, di);
-  const act = h.actions[di];
-  const req = buildSolveReq(h, di);
-  return `<div class="card"><h2>⑤ 校验并提交</h2>
-    <div class="grid g2">
-      ${statLine('决策点', req.decisionNode)}
-      ${statLine('公共牌', st.board.map(cardStr).join(' ') || '—')}
-      ${statLine('Hero 手牌', (h.heroCards || []).map(cardStr).join(' ') || '—')}
-      ${statLine('当前底池', fmt(req.pot, 1) + ' BB')}
-      ${statLine('有效后手', fmt(req.stack, 1) + ' BB')}
-      ${statLine('面对下注', st.facingBet > 0 ? fmt(st.facingBet, 1) + ' BB' : '无（可过牌）')}
-      ${statLine('求解模式', h.mode === 'exploit' ? '剥削 · ' + (ARCHETYPES.find(a => a.id === h.archetype)?.name || '') : '标准 GTO')}
-      ${statLine('尺度集合', (h.sizes || []).map(s => Math.round(s * 100) + '%').join(' / '))}
-      ${statLine('实际动作', act ? formatAction(act) : '未录入（隐藏实现 EV 差）')}
-      ${statLine('范围组合', 'Hero / Villain 按 13×13 矩阵展开')}
-    </div>
-    <div class="hr"></div>
-    ${v.errors.length ? `<div class="notice danger"><b>校验未通过</b><br>${v.errors.map(e => esc(e.path + '：' + e.msg)).join('<br>')}</div>` : '<div class="notice info">行动流状态机校验通过（牌面唯一性、街序、最小加注、后手上限）</div>'}
-    ${v.warnings.length ? `<div class="notice" style="margin-top:8px">${v.warnings.map(esc).join('<br>')}</div>` : ''}
-    ${!v.solveAllowed ? '<div class="notice danger" style="margin-top:8px">V1.0 仅输出单挑底池求解结果：请确认公共牌 ≥3 张且翻后仅两家行动。</div>' : ''}
-    <div class="notice" style="margin-top:8px">求解在浏览器 Worker 中执行，不阻塞页面；分支过大时会提示压缩尺度集合或收窄范围。结果为<b>近似均衡</b>（牌力分档抽象 + 街内有限博弈树 + CFR）。</div>
-  </div>`;
-}
 function statLine(k, v) { return `<div class="stat-line"><span class="muted">${esc(k)}</span><span>${esc(v)}</span></div>`; }
 
 /* ---------------- 结果页 ---------------- */
@@ -736,7 +745,7 @@ function renderResult(id) {
     app.innerHTML = `<div class="page-head"><div><h1>求解中</h1><p class="sub">任务队列：同一时间仅运行 1 个求解任务</p></div></div>
       <div class="card"><div class="row between"><h2>${esc(job.mode === 'exploit' ? '剥削求解' : 'GTO 均衡求解')}</h2><span class="pill">${esc(job.status === 'queued' ? '排队中' : '运行中')}</span></div>
       <div id="solveProgress">${progressHtml(job)}</div></div>
-      <div class="notice">求解范围：翻后单挑；无抽水；近似均衡。超过 60 秒可继续留在页面等待，结果会自动刷新。</div>`;
+      <div class="notice">求解范围：翻前近似 / 翻后单挑；无抽水；结果为近似解。超过 60 秒可继续留在页面等待，结果会自动刷新。</div>`;
     return;
   }
   if (job.status === 'failed') {
@@ -754,6 +763,7 @@ function renderResult(id) {
   app.innerHTML = `
   <div class="page-head"><div><h1>求解结果</h1><p class="sub">${esc(r.decisionNode || '')} · 底池 ${fmt(r.pot, 1)} BB · 后手 ${fmt(r.stacks, 1)} BB</p></div>
     <div class="row"><button class="btn sm" data-act="resCopy" data-id="${esc(job.id)}">复制牌谱</button><button class="btn sm" data-act="resPNG" data-id="${esc(job.id)}">导出图片</button></div></div>
+  ${r.phase === 'preflop' ? '<div class="notice info">翻前近似解：基于起手牌范围对抗权益分档 + 街内 CFR，蒙特卡洛补全 5 张公共牌；未展开翻后博弈树，不等同商用 Solver 的翻前解，仅供范围对抗参考。</div>' : ''}
   <div class="tabs">
     <button class="${tab === 'gto' ? 'on' : ''}" data-act="resTab" data-v="gto" data-id="${esc(job.id)}">GTO 均衡</button>
     ${r.gtoActions ? `<button class="${tab === 'exploit' ? 'on' : ''}" data-act="resTab" data-v="exploit" data-id="${esc(job.id)}">剥削路线</button>` : ''}
@@ -797,7 +807,7 @@ function renderResult(id) {
     <button class="btn" data-act="resRerun" data-id="${esc(job.id)}">调整参数重跑</button>
     <button class="btn" data-act="go" data-v="library">前往牌谱库</button>
   </div></div>
-  <div class="tiny muted">求解口径：10 档牌力抽象 + 街内有限博弈树 + CFR 线性平均；${r.mode === 'exploit' ? '剥削路线按所选对手画像冻结策略后求解。' : '近似均衡，非商用 Solver 精度。'}</div>`;
+  <div class="tiny muted">求解口径：${r.phase === 'preflop' ? '翻前近似（起手牌范围权益分档 + 街内 CFR，蒙特卡洛补全公共牌）' : '10 档牌力抽象 + 街内有限博弈树 + CFR 线性平均'}；${r.mode === 'exploit' ? '剥削路线按所选对手画像冻结策略后求解。' : '近似均衡，非商用 Solver 精度。'}</div>`;
 }
 function progressHtml(job) {
   const p = job.progress || 0;
@@ -848,7 +858,7 @@ function renderSessions() {
 }
 function renderSession(id) {
   const isNew = id === 'new' || !id;
-  const s = isNew ? { id: makeId('session'), name: '', date: today(), type: 'offline', stakes: { sb: 1, bb: 2 }, buyins: [100], cashout: 100, bbValue: 0, note: '' } : state().sessions.find(x => x.id === id);
+  const s = isNew ? { id: makeId('session'), name: '', date: today(), type: 'offline', stakes: { sb: 1, bb: 2 }, buyins: [200], cashout: 200, bbValue: 0, note: '' } : state().sessions.find(x => x.id === id);
   if (!s) { app.innerHTML = '<div class="card"><div class="empty">对局不存在</div></div>'; return; }
   const hands = isNew ? [] : state().hands.filter(h => h.sessionId === s.id);
   app.innerHTML = `<div class="page-head"><div><h1>${isNew ? '新建对局' : esc(s.name)}</h1><p class="sub">${isNew ? '创建一场 session 并绑定复盘手牌' : esc(s.date) + ' · ' + (s.type === 'online' ? '线上' : '线下')}</p></div>
@@ -1111,8 +1121,10 @@ function handleAct(act, ds, ev) {
     case 'pasteToWizard': ui.wizTab = 'wizard'; wizard.wizTab = 'wizard'; render(); break;
     case 'useParsed': {
       const h = wizard.parseInfo.hand;
-      wizard.hand = h; wizard.step = 3; wizard.decisionIndex = null; ui.wizTab = 'wizard'; wizard.wizTab = 'wizard';
-      saveWizard(); render(); toast('已载入牌谱，请配置范围与求解模式'); break;
+      wizard.hand = h; wizard.step = 2; wizard.decisionIndex = null;
+      wizard.stage = stageFromBoard((h.board || []).length); wizard.paramsOpen = false;
+      ui.wizTab = 'wizard'; wizard.wizTab = 'wizard';
+      saveWizard(); render(); toast(`已载入牌谱 · 当前阶段：${STREET_NAME[wizard.stage]}`); break;
     }
     case 'pickCard': openCardPicker(ds.kind, Number(ds.idx)); break;
     case 'pickCardCell': {
@@ -1120,6 +1132,8 @@ function handleAct(act, ds, ev) {
       if (!p) break;
       const cur = p.kind === 'board' ? h.board[p.idx] : p.kind === 'hero' ? h.heroCards[p.idx] : p.kind === 'villain' ? h.villainCards[p.idx] : null;
       if (c === cur) { closeModal(); break; }
+      const arr = p.kind === 'board' ? h.board : p.kind === 'hero' ? h.heroCards : p.kind === 'villain' ? h.villainCards : null;
+      if (arr && p.idx > arr.length) { toast('请按顺序先选择前面的牌'); break; }
       const all = [...h.heroCards, ...h.villainCards, ...h.board, ...h.deadCards];
       if (all.includes(c)) { toast('该牌已被使用，请选择其他牌'); break; }
       if (p.kind === 'hero') h.heroCards[p.idx] = c;
@@ -1138,7 +1152,21 @@ function handleAct(act, ds, ev) {
     }
     case 'clearCards': { const h = wizard.hand; if (ds.kind === 'hero') h.heroCards = []; else if (ds.kind === 'villain') h.villainCards = []; else h.board = []; refresh(); break; }
     case 'setStreet':
-    case 'nextStreet': ui.act.street = v; ui.act.actor = null; render(); break;
+    case 'nextStreet':
+      wizard.stage = v; ui.act.street = null; ui.act.actor = null; wizard.decisionIndex = null;
+      saveWizard(); render(); break;
+    case 'advanceStage': {
+      const si = STREETS.indexOf(wizard.stage);
+      if (si >= 3) { toast('已到河牌，可直接解算'); break; }
+      wizard.stage = STREETS[si + 1];
+      ui.act.street = null; ui.act.actor = null; wizard.decisionIndex = null;
+      const need = stageBoardCount(wizard.stage);
+      const have = (wizard.hand.board || []).filter(c => c != null).length;
+      saveWizard(); render();
+      toast(have >= need ? `进入${STREET_NAME[wizard.stage]}` : `进入${STREET_NAME[wizard.stage]}：请选择 ${need} 张公共牌（已保留 ${have} 张）`);
+      break;
+    }
+    case 'toggleParams': wizard.paramsOpen = !wizard.paramsOpen; render(); break;
     case 'quickAction': {
       const h = wizard.hand, street = actStreet(h), actor = nextActorFor(h, street);
       const { live } = liveFor(h, street);
@@ -1171,8 +1199,8 @@ function handleAct(act, ds, ev) {
       break;
     }
     case 'beginSolve': beginSolve(); break;
-    case 'showReadiness': openReadiness(solveReadiness(wizard.hand)); break;
-    case 'goStep': wizard.step = Math.max(1, Math.min(4, Number(v) || 1)); closeModal(); saveWizard(); render(); break;
+    case 'showReadiness': openReadiness(solveReadiness(wizard.hand, wizard.stage)); break;
+    case 'goStep': wizard.step = Math.max(1, Math.min(2, Number(v) || 1)); closeModal(); saveWizard(); render(); break;
     case 'editAction': openActionEditor(Number(v)); break;
     case 'saveAction': {
       const i = Number(v), a = wizard?.hand?.actions?.[i];
@@ -1205,7 +1233,7 @@ function handleAct(act, ds, ev) {
       if (hi <= 0) { toast('Hero 位置已是首位或不在座位表中，无需生成弃牌'); break; }
       const rest = (h.actions || []).filter(a => String(a.street).toUpperCase() !== 'PREFLOP');
       h.actions = [...pos.slice(0, hi).map(actor => ({ street: 'PREFLOP', actor, type: 'FOLD', amountBB: null })), ...rest];
-      wizard.decisionIndex = null; ui.act.street = 'PREFLOP'; ui.act.actor = hero;
+      wizard.decisionIndex = null; wizard.stage = 'PREFLOP'; ui.act.street = null; ui.act.actor = hero;
       refresh(); toast(`已生成 ${hi} 条翻前弃牌，下一位 ${hero}`); break;
     }
     case 'toggleBulk': ui.act.bulk = !ui.act.bulk; render(); break;
@@ -1221,6 +1249,7 @@ function handleAct(act, ds, ev) {
       const acts = normalizeActionAmounts(r.actions, wizard.hand);
       wizard.hand.actions = acts;
       wizard.decisionIndex = null; ui.act.street = null; ui.act.actor = null;
+      wizard.stage = stageFromBoard((wizard.hand.board || []).length);
       const chk = validateHand(wizard.hand);
       const actionErrs = chk.errors.filter(e => String(e.path).startsWith('actions'));
       const otherErrs = chk.errors.length - actionErrs.length;
@@ -1229,7 +1258,7 @@ function handleAct(act, ds, ev) {
         msg: `已录入 ${acts.length} 条动作`
           + (actionErrs.length ? '；行动流错误：' + actionErrs.slice(0, 3).map(e => e.msg).join('；') : '，行动流校验通过')
           + (r.warnings.length ? '（' + r.warnings.join('；') + '）' : '')
-          + (otherErrs ? '（手牌 / 公共牌请在第一步补齐）' : '')
+          + (otherErrs ? '（手牌请在第 1 步补齐，公共牌在对应街阶段选择）' : '')
       };
       refresh(); break;
     }
@@ -1251,7 +1280,9 @@ function handleAct(act, ds, ev) {
         { street: 'TURN', actor: 'BTN', type: 'BET', amountBB: 11 },
         { street: 'TURN', actor: 'BB', type: 'FOLD', amountBB: null }
       ];
-      h.result = 'hero'; wizard.decisionIndex = null; refresh(); toast('已填充标准示例牌谱'); break;
+      h.result = 'hero'; wizard.decisionIndex = null;
+      wizard.stage = stageFromBoard(h.board.length); ui.act.street = null; ui.act.actor = null;
+      refresh(); toast(`已填充标准示例 · 当前阶段：${STREET_NAME[wizard.stage]}`); break;
     }
     case 'delAction': {
       const i = Number(v);
@@ -1454,6 +1485,6 @@ document.addEventListener('change', e => {
 /* ---------------- 启动 ---------------- */
 (async function boot() {
   await initDB();
-  $('#versionTag').textContent = 'V1.2 · 翻后单挑';
+  $('#versionTag').textContent = 'V1.3 · 翻前 / 翻后';
   render();
 })();

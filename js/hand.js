@@ -182,7 +182,8 @@ export function parseHH(text) {
   hand.board = boardAcc;
   hand.potBB = null;
   if (hand.heroCards.length !== 2) errors.push({ line: 1, msg: 'Hero 必须恰好 2 张手牌' });
-  if (hand.board.length < 3) warnings.push('公共牌不足 3 张：可归档，但无法求解（V1.0 仅翻后）');
+  const boardN = (hand.board || []).length;
+  if (boardN === 1 || boardN === 2) warnings.push('公共牌需为 0 张（翻前）或 3–5 张（翻后）；当前仅 1–2 张，不输出求解结果（仅可归档）');
   const all = [...hand.heroCards, ...hand.board, ...hand.villainCards, ...hand.deadCards];
   if (new Set(all).size !== all.length) errors.push({ line: 1, msg: '牌面重复（手牌/公共牌/对手手牌/死牌冲突）' });
   // 百分比下注与 Pot 覆盖值落在 hand 上，供 deriveState 使用
@@ -193,6 +194,7 @@ export function parseHH(text) {
 /** 行动流状态机校验（附录 A）。返回 {ok, errors, warnings, solveAllowed, potTrace} */
 export function validateHand(hand) {
   const errors = [], warnings = [], potTrace = [];
+  const boardN = (hand.board || []).length;
   const positions = positionsFor(hand.tableSize).map(p => p.toUpperCase());
   const known = new Set([...positions, 'HERO', 'VILLAIN']);
   const cards = [...(hand.heroCards || []), ...(hand.board || []), ...(hand.villainCards || []), ...(hand.deadCards || [])];
@@ -200,7 +202,7 @@ export function validateHand(hand) {
   if ((hand.heroCards || []).length !== 2) errors.push({ path: 'heroCards', msg: 'Hero 手牌必须 2 张' });
   if ((hand.villainCards || []).length && hand.villainCards.length !== 2) errors.push({ path: 'villainCards', msg: 'Villain 手牌必须 0 或 2 张' });
   if ((hand.board || []).length > 5) errors.push({ path: 'board', msg: '公共牌最多 5 张' });
-  if ((hand.board || []).length < 3) warnings.push('公共牌不足 3 张：V1.0 不输出求解结果（仅可归档）');
+  if (boardN === 1 || boardN === 2) warnings.push('公共牌需为 0 张（翻前）或 3–5 张（翻后）；当前仅 1–2 张，不输出求解结果（仅可归档）');
   const stack = num(hand.stackBB) || 0;
   const sb = num(hand.stakes?.sb) || 1, bb = num(hand.stakes?.bb) || 2;
   const blindsBB = (sb / bb) + 1;
@@ -276,8 +278,8 @@ export function validateHand(hand) {
     else if (Math.abs(v - pot) > Math.max(2, pot * 0.3)) warnings.push(`录入底池 ${v} BB 与行动流推算 ${pot.toFixed(1)} BB 差异较大，求解将以录入值为准`);
   }
   const others = [...postActors].filter(p => p !== String(hand.positions.hero).toUpperCase() && p !== String(hand.positions.villain).toUpperCase() && p !== 'HERO' && p !== 'VILLAIN');
-  const solveAllowed = (hand.board || []).length >= 3 && others.length === 0;
-  if (!solveAllowed && (hand.board || []).length >= 3) warnings.push('V1.0 仅输出单挑底池求解结果（多人底池可录入归档，但求解不可用）');
+  const solveAllowed = (boardN === 0 || boardN >= 3) && others.length === 0;
+  if (!solveAllowed && boardN >= 3) warnings.push('V1.0 仅输出单挑底池求解结果（多人底池可录入归档，但求解不可用）');
   // 当前下注局面，供录入界面生成默认金额 / 按钮可用态（与状态机同一套变量）
   const live = {
     pot: Math.round(pot * 10) / 10,
@@ -290,11 +292,20 @@ export function validateHand(hand) {
   return { ok: errors.length === 0, errors, warnings, solveAllowed, potTrace, computedPotBB: Math.round(pot * 10) / 10, live, otherActors: others };
 }
 
+/** 按已录入公共牌数推断当前所处的街阶段 */
+export function stageFromBoard(n) {
+  return n >= 5 ? 'RIVER' : n >= 4 ? 'TURN' : n >= 3 ? 'FLOP' : 'PREFLOP';
+}
+/** 各街阶段所需的公共牌张数 */
+export function stageBoardCount(stage) {
+  return stage === 'FLOP' ? 3 : stage === 'TURN' ? 4 : stage === 'RIVER' ? 5 : 0;
+}
 /**
  * 解算就绪度：把「为什么还不能解算」拆成可逐条修复的清单。
- * 返回 { ready, items:[{key,ok,label,hint,step}] }，step 指向需要修改的向导步骤。
+ * stage 为当前录入阶段（可选，缺省按公共牌数推断）。
+ * 返回 { ready, items:[{key,ok,label,hint,step}], phase, stage }。
  */
-export function solveReadiness(hand) {
+export function solveReadiness(hand, stage = null) {
   const v = validateHand(hand);
   const items = [];
   const push = (key, ok, label, hint, step) => items.push({ key, ok: !!ok, label, hint: ok ? '' : (hint || ''), step });
@@ -302,20 +313,28 @@ export function solveReadiness(hand) {
   const boardN = (hand.board || []).length;
   const villainN = (hand.villainCards || []).length;
   const stack = Number(hand.stackBB) || 0;
+  const target = stage || stageFromBoard(boardN);
+  const need = stageBoardCount(target);
+  const preflop = target === 'PREFLOP';
 
   push('heroCards', heroN === 2, 'Hero 手牌 2 张', heroN === 0 ? '尚未选择' : `当前 ${heroN} 张`, 1);
-  push('board', boardN >= 3, '公共牌 ≥ 3 张', boardN === 0 ? '尚未选择' : `当前 ${boardN} 张，翻牌需 3 张`, 1);
+  push('board', boardN >= need,
+    preflop ? '翻前场景 · 无需公共牌' : `公共牌 ≥ ${need} 张（${STREETS.indexOf(target) > 0 ? { FLOP: '翻牌', TURN: '转牌', RIVER: '河牌' }[target] : '翻后'}）`,
+    boardN === 0 ? '尚未选择' : `当前 ${boardN} 张，需 ${need} 张`, 2);
   push('villainCards', villainN === 0 || villainN === 2, '对手手牌为空或 2 张', `当前 ${villainN} 张`, 1);
   push('unique', !v.errors.some(e => e.path === 'cards'), '牌面无重复', '手牌 / 公共牌 / 死牌中存在同一张牌', 1);
   push('stack', stack > 0, '有效后手 > 0 BB', '筹码深度缺失', 1);
   const actErrs = v.errors.filter(e => String(e.path).startsWith('actions'));
   push('actions', actErrs.length === 0, '行动流通过状态机校验', actErrs[0] ? actErrs[0].msg : '', 2);
   const others = v.otherActors || [];
-  push('headsUp', others.length === 0, '翻后仅 Hero 与对手两家', others.length ? `翻后出现第三方位置：${others.join('、')}` : '', 2);
+  push('headsUp', preflop || others.length === 0,
+    preflop ? '翻前按单挑范围对抗求解' : '翻后仅 Hero 与对手两家',
+    others.length ? `翻后出现第三方位置：${others.join('、')}` : '', 2);
 
   return {
     ready: items.every(i => i.ok) && v.solveAllowed,
-    items, errors: v.errors, warnings: v.warnings, solveAllowed: v.solveAllowed
+    items, errors: v.errors, warnings: v.warnings, solveAllowed: v.solveAllowed,
+    phase: preflop ? 'preflop' : 'postflop', stage: target, boardNeeded: need
   };
 }
 
@@ -425,11 +444,14 @@ export function deriveState(hand, decisionIndex) {
       lastRaise = Math.max(1, toCall); lastAggSide = side;
     } else if (a.type === 'CALL') toCall = 0;
   }
-  const street = STREETS[Math.max(1, streetSeen)];
-  const boardLen = street === 'FLOP' ? 3 : street === 'TURN' ? 4 : 5;
+  const street = STREETS[Math.max(0, streetSeen)];
+  const boardLen = street === 'PREFLOP' ? 0 : street === 'FLOP' ? 3 : street === 'TURN' ? 4 : 5;
   const board = (hand.board || []).slice(0, boardLen);
   const stack = Math.max(0, (num(hand.stackBB) || 0) - Math.max(totalInvest.hero, totalInvest.villain));
-  const facingBet = lastAggSide === 'villain' ? Math.max(0, toCall) : 0;
+  const facingBet = street === 'PREFLOP'
+    // 翻前大盲 1BB 视作待跟注额：无主动加注方时仍需跟注，不能过牌
+    ? (lastAggSide === 'villain' ? Math.max(0, toCall) : lastAggSide === null ? (toCall > 0 ? toCall : 1) : 0)
+    : (lastAggSide === 'villain' ? Math.max(0, toCall) : 0);
   const potUse = hand.potBB != null && Number.isFinite(Number(hand.potBB)) ? Number(hand.potBB) : pot;
   const heroOOP = heroIsOOP(hand);
   return {
@@ -440,8 +462,12 @@ export function deriveState(hand, decisionIndex) {
 }
 export function heroDecisionIndices(hand) {
   const out = [];
+  // 翻前牌谱（无公共牌）复盘翻前 Hero 动作；翻后牌谱仍以翻后动作作为决策点
+  const preflopScene = (hand.board || []).length === 0;
   (hand.actions || []).forEach((a, i) => {
-    if (actorSide(hand, a.actor) === 'hero' && STREETS.indexOf(String(a.street).toUpperCase()) > 0) out.push(i);
+    const si = STREETS.indexOf(String(a.street).toUpperCase());
+    const allowed = preflopScene ? si === 0 : si > 0;
+    if (actorSide(hand, a.actor) === 'hero' && allowed) out.push(i);
   });
   return out;
 }

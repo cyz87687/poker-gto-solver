@@ -124,7 +124,7 @@ export function buildResultImage(result, hand, meta = {}) {
   ctx.fillText(`${meta.date || ''}   ${meta.handCards || ''}   ${meta.board || ''}   ${result.decisionNode || ''}`, 28, 70);
   ctx.fillStyle = '#f0f2f5'; ctx.fillRect(28, 84, w - 56, 34);
   ctx.fillStyle = '#5c6675'; ctx.font = '12px sans-serif';
-  ctx.fillText('求解口径：10 档牌力抽象 + 街内有限博弈树 + CFR 线性平均（近似均衡）', 38, 106);
+  ctx.fillText(result.phase === 'preflop' ? '求解口径：翻前近似（起手牌范围权益分档 + 街内 CFR，未展开翻后博弈树）' : '求解口径：10 档牌力抽象 + 街内有限博弈树 + CFR 线性平均（近似均衡）', 38, 106);
   ctx.fillStyle = '#1c2330'; ctx.font = '600 15px sans-serif';
   ctx.fillText(result.mode === 'exploit' ? `剥削路线（对手画像：${result.archetypeLabel || ''}）` : 'GTO 均衡输出', 28, 148);
   const rows = result.actions || [];
@@ -153,7 +153,7 @@ export function buildResultImage(result, hand, meta = {}) {
     `底池 ${result.pot} BB / 有效后手 ${result.stacks} BB / 迭代 ${result.iterations} 次`,
     result.evLossBB != null ? `实现 EV 差 ${result.evLossBB} BB（基准：${result.mode === 'exploit' ? '剥削路线' : 'GTO 均衡'}）` : '未录入实际动作，隐藏实现 EV 差',
     result.exploitGainBB != null ? `剥削增益 ${result.exploitGainBB} BB（基于对手画像假设）` : `可剥削度 ${result.exploitabilityMbb ?? '—'} mbb/hand`,
-    result.mode === 'exploit' ? '口径：冻结对手画像后求 Hero 最优应对' : '口径：近似均衡（牌力分档抽象 + 街内有限博弈树）'
+    result.phase === 'preflop' ? '口径：翻前近似解，仅供范围对抗参考' : (result.mode === 'exploit' ? '口径：冻结对手画像后求 Hero 最优应对' : '口径：近似均衡（牌力分档抽象 + 街内有限博弈树）')
   ];
   lines.forEach(l => { ctx.fillText(l, 28, y); y += 22; });
   ctx.fillStyle = '#8b94a3'; ctx.font = '11px sans-serif';

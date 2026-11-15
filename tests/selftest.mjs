@@ -6,7 +6,8 @@ import {
 import {
   parseHH, validateHand, deriveState, serializeHH, defaultHand, heroDecisionIndices,
   handProfitBB, handClass, positionsFor, parseActionText, normalizeActionAmounts,
-  postflopOrder, firstToActPostflop, heroIsOOP, solveReadiness
+  postflopOrder, firstToActPostflop, heroIsOOP, solveReadiness,
+  stageFromBoard, stageBoardCount
 } from '../js/hand.js';
 import { solveCore, previewCore, ARCHETYPE_PARAMS } from '../js/solver-core.js';
 import {
@@ -239,7 +240,7 @@ console.log('\n[8] 翻后行动顺序与解算就绪度');
   const empty = defaultHand();
   const r0 = solveReadiness(empty);
   ok('空牌谱不可解算', r0.ready === false);
-  ok('空牌谱列出缺失项', r0.items.filter(x => !x.ok).length >= 2, JSON.stringify(r0.items.filter(x => !x.ok).map(x => x.key)));
+  ok('空牌谱列出缺失项', r0.items.filter(x => !x.ok).length >= 1, JSON.stringify(r0.items.filter(x => !x.ok).map(x => x.key)));
   ok('缺失项带修复步骤', r0.items.filter(x => !x.ok).every(x => x.step >= 1));
 
   // 就绪度：完整单挑牌谱可解算
@@ -261,6 +262,41 @@ console.log('\n[8] 翻后行动顺序与解算就绪度');
   const r3 = solveReadiness(multi);
   ok('翻后第三人行动时阻塞解算', r3.ready === false);
   ok('多人底池提示指向步骤 2', r3.items.find(x => x.key === 'headsUp').step === 2, JSON.stringify(r3.items.find(x => x.key === 'headsUp')));
+}
+
+console.log('\n[8] 翻前场景（board = 0）');
+{
+  const h = defaultHand();
+  h.heroCards = C('As', 'Kd');
+  h.actions = [
+    { street: 'PREFLOP', actor: 'UTG', type: 'FOLD', amountBB: null },
+    { street: 'PREFLOP', actor: 'MP', type: 'FOLD', amountBB: null },
+    { street: 'PREFLOP', actor: 'CO', type: 'FOLD', amountBB: null },
+    { street: 'PREFLOP', actor: 'BTN', type: 'RAISE_TO', amountBB: 3 },
+    { street: 'PREFLOP', actor: 'SB', type: 'FOLD', amountBB: null }
+  ];
+  const v = validateHand(h);
+  ok('翻前 0 张公共牌允许求解', v.ok && v.solveAllowed === true, JSON.stringify(v.errors));
+  ok('翻前不再提示公共牌不足', !v.warnings.some(w => /公共牌/.test(w)), JSON.stringify(v.warnings));
+  const rd = solveReadiness(h, 'PREFLOP');
+  ok('翻前就绪度通过且 phase=preflop', rd.ready === true && rd.phase === 'preflop', JSON.stringify(rd.items.filter(i => !i.ok)));
+  ok('翻前就绪度不要求公共牌', rd.items.find(i => i.key === 'board').ok === true);
+  const rd2 = solveReadiness(h, 'FLOP');
+  ok('切到翻牌但公共牌 0 张时阻塞', rd2.ready === false && rd2.items.find(i => i.key === 'board').ok === false);
+  const st = deriveState(h, 3);
+  ok('deriveState 返回 PREFLOP / board 0 张', st.street === 'PREFLOP' && st.board.length === 0, JSON.stringify({ street: st.street, board: st.board.length }));
+  ok('翻前面对大盲待跟注额', st.facingBet > 0, String(st.facingBet));
+  ok('翻前 Hero 动作可作决策点', heroDecisionIndices(h).includes(3), JSON.stringify(heroDecisionIndices(h)));
+  ok('阶段推断正确', stageFromBoard(0) === 'PREFLOP' && stageFromBoard(3) === 'FLOP' && stageFromBoard(4) === 'TURN' && stageFromBoard(5) === 'RIVER');
+  ok('各阶段所需公共牌数正确', stageBoardCount('PREFLOP') === 0 && stageBoardCount('FLOP') === 3 && stageBoardCount('TURN') === 4 && stageBoardCount('RIVER') === 5);
+
+  const pre = solveCore(makeReq({ board: [], iterations: 30, facingBet: 1, oppChecked: false, decisionNode: 'PREFLOP|BTN|vs_blind', userAction: null }), () => {});
+  ok('翻前求解返回 phase=preflop', pre.phase === 'preflop' && pre.boardCount === 0, pre.phase + '/' + pre.boardCount);
+  ok('翻前动作含弃牌 / 跟注 / 加注', pre.actions.some(a => a.type === 'FOLD') && pre.actions.some(a => a.type === 'CALL') && pre.actions.some(a => !['FOLD', 'CALL', 'CHECK'].includes(a.type)), JSON.stringify(pre.actions.map(a => a.type)));
+  ok('翻前频率合计 100%', Math.abs(pre.actions.reduce((a, x) => a + x.freq, 0) - 1) <= 0.001);
+  ok('翻前口径已标注为近似', /翻前近似/.test(pre.convergenceNote));
+  const pvPre = previewCore(makeReq({ board: [], iterations: 20, facingBet: 1, oppChecked: false }), '跟注', () => {});
+  ok('翻前路线预览一次补齐 3 张翻牌', pvPre.available === true && pvPre.street === 'FLOP' && pvPre.board.length === 3, JSON.stringify({ available: pvPre.available, street: pvPre.street, board: pvPre.board }));
 }
 
 console.log(`\n结果：${pass} 通过 / ${fail} 失败\n`);

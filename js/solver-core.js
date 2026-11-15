@@ -1,5 +1,6 @@
-/* solver-core.js —— 翻后单挑近似均衡求解器
+/* solver-core.js —— 翻前近似 / 翻后单挑近似均衡求解器
  * 牌力分档抽象 + 街内有限博弈树 + 反事实遗憾最小化(CFR)
+ * 翻前：board=0，用蒙特卡洛补全 5 张公共牌估算起手牌范围权益（不展开翻后博弈树）
  * 剥削模式 = 对手画像 -> 节点锁定(Node Locking) -> 求解 Hero 最优应对
  * 纯逻辑，无 DOM 依赖，可在 Web Worker / Node 中运行。
  */
@@ -390,7 +391,8 @@ function comboClassIndices(c1, c2) {
 export function solveCore(req, onProgress = () => {}) {
   const t0 = Date.now();
   const board = (req.board || []).slice(0, 5);
-  if (board.length < 3) throw new Error('V1.0 仅支持翻后（公共牌 3–5 张）求解');
+  if (board.length === 1 || board.length === 2) throw new Error('公共牌需为 0 张（翻前）或 3–5 张（翻后）；当前 1–2 张无法求解');
+  const phase = board.length === 0 ? 'preflop' : 'postflop';
   if ((req.sizes || []).length > 4) throw new Error('每街下注尺度最多 4 个，请压缩尺度集合');
   const iterations = req.iterations || (req.preset === 'precise' ? 420 : 150);
   const ctx = makeCtx(req, iterations);
@@ -411,12 +413,12 @@ export function solveCore(req, onProgress = () => {}) {
   const villainCombos = matrixToCombos(villainRange, used, 0.02, 380);
   if (!heroCombos.length || !villainCombos.length) throw new Error('范围为空：与手牌/公共牌/死牌冲突后无可用组合，请放宽范围');
 
-  const samples = board.length >= 5 ? 0 : 84;
+  const samples = board.length >= 5 ? 0 : board.length === 0 ? 96 : 84;
   const heroEq = heroCombos.map(c => comboEquityVsRange([c[0], c[1]], villainCombos, board, samples, rng));
   const villainEq = villainCombos.map(c => comboEquityVsRange([c[0], c[1]], heroCombos, board, samples, rng));
   const hb = bucketize(heroCombos, heroEq, N_BUCKETS);
   const vb = bucketize(villainCombos, villainEq, N_BUCKETS);
-  ctx.E = buildEquityMatrix(heroCombos, villainCombos, hb, vb, board, N_BUCKETS, 20, rng);
+  ctx.E = buildEquityMatrix(heroCombos, villainCombos, hb, vb, board, N_BUCKETS, board.length === 0 ? 28 : 20, rng);
   const pH = new Float64Array(N_BUCKETS), pV = new Float64Array(N_BUCKETS);
   heroCombos.forEach((_, i) => { pH[hb.bucketOf[i]] += 1; });
   villainCombos.forEach((_, i) => { pV[vb.bucketOf[i]] += 1; });
@@ -448,13 +450,16 @@ export function solveCore(req, onProgress = () => {}) {
   const evLossBB = userIdx >= 0 ? Math.max(0, Math.round((bestEV - gtoEV[userIdx]) * 100) / 100) : null;
 
   const base = {
-    mode: 'gto', archetype: null, decisionNode: req.decisionNode || 'FLOP|HERO',
+    mode: 'gto', archetype: null, phase, boardCount: board.length,
+    decisionNode: req.decisionNode || (phase === 'preflop' ? 'PREFLOP|HERO' : 'FLOP|HERO'),
     pot: Math.round(req.pot * 10) / 10, stacks: Math.round(req.stack * 10) / 10,
     actions: rootActs.map((a, i) => ({ type: a.type, sizeBB: a.amount != null ? a.amount : null, label: a.label, freq: gtoFreqRounded[i], ev: Math.round(gtoEV[i] * 100) / 100 })),
     userAction: req.userAction || null, evLossBB,
     exploitGainBB: null, exploitabilityMbb, iterations, treeSize,
     durationMs: Date.now() - t0,
-    convergenceNote: '近似均衡：10 档牌力抽象 + 街内有限博弈树 + CFR 线性平均；可剥削度按牌力分档先验下的最优应对增益估计，非 PioSolver 级精度',
+    convergenceNote: phase === 'preflop'
+      ? '翻前近似：起手牌范围对抗权益分档（蒙特卡洛补全 5 张公共牌）+ 街内 CFR；未展开翻后博弈树，不等同商业 Solver 的翻前解，仅供范围对抗参考'
+      : '近似均衡：10 档牌力抽象 + 街内有限博弈树 + CFR 线性平均；可剥削度按牌力分档先验下的最优应对增益估计，非 PioSolver 级精度',
     ranges: { hero: req.heroRange, villain: villainRange, heroCombos: heroCombos.length, villainCombos: villainCombos.length },
     heatmap: {
       hero: heatFor(ctx, root, heroCombos, hb, villainCombos, vb, 'hero'),
@@ -543,18 +548,22 @@ export function previewCore(req, chosenActionLabel, onProgress = () => {}) {
   const pool = deckExcluding([...board, ...(req.heroCards || []), ...(req.villainCards || [])]);
   if (!pool.length) return { available: false, reason: '无可用的后续公共牌' };
   const rng = mulberry32(hashSeed('preview|' + JSON.stringify(board) + chosenActionLabel));
-  const next = pool[Math.floor(rng() * pool.length)];
-  const newBoard = [...board, next];
+  // 翻前一次补齐 3 张翻牌；翻后每次补 1 张
+  const need = board.length === 0 ? 3 : 1;
+  const bag = pool.slice(), drawn = [];
+  for (let k = 0; k < need && bag.length; k++) drawn.push(bag.splice(Math.floor(rng() * bag.length), 1)[0]);
+  if (drawn.length < need) return { available: false, reason: '无可用的后续公共牌' };
+  const newBoard = [...board, ...drawn];
   const extra = (req.sizes || [0.5])[0] * Math.max(1, req.pot) * 2;
   const sub = solveCore({
     ...req, board: newBoard, pot: Math.max(1, req.pot + extra),
     stack: Math.max(1, req.stack - extra / 2), facingBet: 0, oppChecked: true,
     iterations: 120, preset: 'fast', mode: 'gto', userAction: null,
-    decisionNode: (newBoard.length === 4 ? 'TURN' : 'RIVER') + '|HERO'
+    decisionNode: (newBoard.length === 3 ? 'FLOP' : newBoard.length === 4 ? 'TURN' : 'RIVER') + '|HERO'
   }, onProgress);
   return {
-    available: true, street: newBoard.length === 4 ? 'TURN' : 'RIVER',
-    newCard: cardStr(next), board: newBoard.map(cardStr),
+    available: true, street: newBoard.length === 3 ? 'FLOP' : newBoard.length === 4 ? 'TURN' : 'RIVER',
+    newCard: drawn.map(cardStr).join(' '), board: newBoard.map(cardStr),
     actions: sub.actions, exploitabilityMbb: sub.exploitabilityMbb, iterations: sub.iterations
   };
 }

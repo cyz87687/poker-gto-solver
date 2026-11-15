@@ -153,7 +153,7 @@ function inPeriod(dateStr, period, now = Date.now()) {
   const days = period === '7d' ? 7 : period === 'quarter' ? 90 : 30;
   return now - t <= days * 86400000;
 }
-export function computeStats(period = '30d') {
+export function computeStats(period = 'all') {
   const s = state();
   const sessions = s.sessions.filter(x => inPeriod(x.date, period)).slice().sort((a, b) => String(a.date).localeCompare(String(b.date)));
   const hands = s.hands.filter(h => inPeriod(h.createdAt, period));
