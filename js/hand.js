@@ -68,11 +68,39 @@ export function heroIsOOP(hand) {
 function num(v) { const n = Number(v); return Number.isFinite(n) ? n : null; }
 
 /** HH v1 解析：返回 { hand, errors:[{line,msg}], warnings:[...] } */
+/**
+ * 从行动流推断对手位置。
+ * HH v1 没有 Villain 位置字段，defaultHand 默认 BB；当 Hero 就是 BB 时会与 Hero 冲突，
+ * 导致对手的加注/下注被判为第三方、solveAllowed=false。这里按「非 Hero 的实质行动者」推断。
+ */
+function inferVillainPosition(hand, explicit) {
+  const hero = String(hand.positions.hero || '').toUpperCase();
+  const pos = positionsFor(hand.tableSize).map(p => String(p).toUpperCase());
+  if (explicit && pos.includes(explicit) && explicit !== hero) return explicit;
+  const tally = skipFold => {
+    const m = new Map();
+    for (const a of hand.actions || []) {
+      const u = String(a.actor || '').toUpperCase();
+      if (u === 'HERO' || u === hero || !pos.includes(u)) continue;
+      if (skipFold && a.type === 'FOLD') continue;
+      m.set(u, (m.get(u) || 0) + 1);
+    }
+    return m;
+  };
+  for (const skipFold of [true, false]) {
+    const counts = tally(skipFold);
+    if (!counts.size) continue;
+    const best = [...counts.entries()].sort((a, b) => b[1] - a[1] || pos.indexOf(a[0]) - pos.indexOf(b[0]))[0][0];
+    if (best !== hero) return best;
+  }
+  return pos.find(p => p !== hero) || hand.positions.villain;
+}
 export function parseHH(text) {
   const lines = String(text || '').split(/\r?\n/);
   const hand = defaultHand();
   const errors = [], warnings = [];
   const potOverrides = {};
+  let explicitVillain = null;
   let boardAcc = [], streetSeen = -1, hasStreet = false;
   for (let li = 0; li < lines.length; li++) {
     const line = lines[li].trim();
@@ -107,7 +135,10 @@ export function parseHH(text) {
     }
     if (/^Villain:/i.test(line)) {
       m = line.match(/\[([^\]]*)\]/);
-      if (!m) errors.push({ line: ln, msg: 'Villain 格式应为 Villain: [QhQd]' });
+      // 支持显式位置：Villain: BTN [QhQd]；缺省仅 [QhQd] 时按行动流推断
+      const pm = line.match(/^Villain:\s*([A-Za-z+]+)\s*\[/);
+      if (pm) explicitVillain = pm[1].toUpperCase();
+      if (!m) errors.push({ line: ln, msg: 'Villain 格式应为 Villain: [QhQd] 或 Villain: BTN [QhQd]' });
       else { try { hand.villainCards = parseCardList(m[1]); } catch (e) { errors.push({ line: ln, msg: e.message }); } }
       continue;
     }
@@ -188,6 +219,14 @@ export function parseHH(text) {
   if (new Set(all).size !== all.length) errors.push({ line: 1, msg: '牌面重复（手牌/公共牌/对手手牌/死牌冲突）' });
   // 百分比下注与 Pot 覆盖值落在 hand 上，供 deriveState 使用
   hand.potOverrides = potOverrides;
+  // HH v1 缺省 Villain 位置时按行动流推断，避免 Hero=BB 时两家位置冲突导致对手行动被判第三方
+  hand.positions.villain = inferVillainPosition(hand, explicitVillain);
+  // 位置变化后同步默认范围模板（Hero=BB → BB 防守，对手按开池理解）
+  const posPreset = p => ({ BB: 'bb', SB: 'bb', BTN: 'btn' })[p] || 'btn';
+  hand.rangePresets.hero = posPreset(hand.positions.hero);
+  hand.ranges.hero = presetMatrix(hand.rangePresets.hero);
+  hand.rangePresets.villain = posPreset(hand.positions.villain);
+  hand.ranges.villain = presetMatrix(hand.rangePresets.villain);
   return { hand, errors, warnings };
 }
 
@@ -553,6 +592,28 @@ export function heroDecisionIndices(hand) {
     if (actorSide(hand, a.actor) === 'hero' && allowed) out.push(i);
   });
   return out;
+}
+/**
+ * 待应对决策点：牌谱以对手的下注/加注/全下结束、且本街尚未闭合（Hero 还没跟注/弃牌）时，
+ * 真实要复盘的是「还没录入的下一步」——即 actions.length 这个虚拟决策点。
+ * 例如 Preflop BTN raise, BB call / Flop BB check, BTN bet  ← 应解算 Hero 面对这个 bet。
+ * 返回 { index, street, toCall, pot } 或 null。
+ */
+export function pendingHeroDecision(hand) {
+  const acts = hand.actions || [];
+  if (!acts.length) return null;
+  const last = acts[acts.length - 1];
+  const st = String(last.street || '').toUpperCase();
+  const si = STREETS.indexOf(st);
+  if (si < 0) return null;
+  const flow = actionFlow(hand, st);
+  if (flow.closed || flow.handOver || !flow.actor) return null;
+  const hero = String(hand.positions?.hero || '').toUpperCase();
+  const actor = String(flow.actor).toUpperCase();
+  if (actor !== hero && actor !== 'HERO') return null;
+  if (actorSide(hand, last.actor) !== 'villain') return null;
+  if (!['BET', 'RAISE_TO', 'ALLIN'].includes(last.type)) return null;
+  return { index: acts.length, street: st, toCall: flow.toCall, pot: flow.pot };
 }
 export function handProfitBB(hand) {
   if (!hand.result) return 0;

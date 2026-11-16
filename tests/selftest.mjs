@@ -4,7 +4,7 @@ import {
   comboEquityVsRange, mulberry32, applyRangeWidth
 } from '../js/cards.js';
 import {
-  parseHH, validateHand, deriveState, serializeHH, defaultHand, heroDecisionIndices,
+  parseHH, validateHand, deriveState, serializeHH, defaultHand, heroDecisionIndices, pendingHeroDecision,
   handProfitBB, handClass, positionsFor, parseActionText, normalizeActionAmounts,
   postflopOrder, firstToActPostflop, heroIsOOP, solveReadiness,
   stageFromBoard, stageBoardCount, actionFlow
@@ -358,6 +358,36 @@ console.log('\n[9] 行动流顺位与街结束判定（V1.4）');
   ok('翻前跛入后轮到大盲、待跟注归零（大盲期权）', fl.actor === 'BB' && fl.toCall === 0 && !fl.closed, JSON.stringify({ actor: fl.actor, toCall: fl.toCall, closed: fl.closed }));
   hl.actions.push({ street: 'PREFLOP', actor: 'BB', type: 'CHECK', amountBB: null });
   ok('大盲过牌后本街结束', actionFlow(hl, 'PREFLOP').closed === true);
+}
+
+console.log('\n[10] HH 导入位置推断与待应对决策点（V1.5 回归）');
+{
+  const userHH = `# PokerGTO HH v1
+Game: NLHE
+Stakes: SB=1 BB=2
+Table: 6max
+Hero: BB [Kc4c]
+Stacks: Hero=100 Villain=100 (BB)
+Preflop:  BTN raise 6.0, BB call 6.0
+Flop: [Kd6h9s]  BB check, BTN bet 9.0`;
+  const r = parseHH(userHH), h = r.hand, v = validateHand(h);
+  ok('Hero=BB 时 Villain 被推断为 BTN（不再与 Hero 冲突）', h.positions.hero === 'BB' && h.positions.villain === 'BTN', JSON.stringify(h.positions));
+  ok('对手加注/下注不再被判第三方', v.otherActors.length === 0 && v.solveAllowed === true, JSON.stringify({ other: v.otherActors, allowed: v.solveAllowed }));
+  ok('范围模板随位置同步（Hero=BB 用 BB 防守）', h.rangePresets.hero === 'bb' && h.rangePresets.villain === 'btn', JSON.stringify(h.rangePresets));
+  const pend = pendingHeroDecision(h);
+  ok('识别到 Hero 待应对的虚拟决策点', pend && pend.index === h.actions.length && pend.street === 'FLOP' && pend.toCall === 9, JSON.stringify(pend));
+  const st = deriveState(h, pend.index);
+  ok('待决策点局面：翻牌 / 面对 9BB 下注 / 底池 22.5', st.street === 'FLOP' && st.facingBet === 9 && Math.abs(st.pot - 22.5) < 0.05, JSON.stringify({ street: st.street, facing: st.facingBet, pot: st.pot }));
+  // 对手下注已被跟注 → 不再是待决策点
+  const h2 = JSON.parse(JSON.stringify(h));
+  h2.actions.push({ street: 'FLOP', actor: 'BB', type: 'CALL', amountBB: 9 });
+  ok('Hero 跟注后不再有待应对决策点', pendingHeroDecision(h2) === null, JSON.stringify(pendingHeroDecision(h2)));
+  // 显式 Villain 位置优先
+  const explicit = parseHH(userHH.replace('Stacks:', 'Villain: BTN [QhQd]\nStacks:'));
+  ok('显式 Villain 位置被尊重', explicit.hand.positions.villain === 'BTN', JSON.stringify(explicit.hand.positions));
+  // 序列化往返保持位置
+  const back = parseHH(serializeHH(h));
+  ok('序列化往返后位置仍正确', back.hand.positions.hero === 'BB' && back.hand.positions.villain === 'BTN', JSON.stringify(back.hand.positions));
 }
 
 console.log(`\n结果：${pass} 通过 / ${fail} 失败\n`);

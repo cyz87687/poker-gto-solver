@@ -2,7 +2,7 @@
 import { RANKS, SUITS, SUIT_SYM, cardStr, cardLabel, isRed, parseCardList, parseCard, presetMatrix, emptyMatrix, RANGE_PRESETS, classLabel } from './cards.js';
 import {
   STREETS, POS6, POS9, ACTION_TYPES, BUILTIN_TAGS, ARCHETYPES, positionsFor, makeId, defaultHand,
-  formatAction, parseHH, validateHand, deriveState, heroDecisionIndices, serializeHH, handClass, handProfitBB,
+  formatAction, parseHH, validateHand, deriveState, heroDecisionIndices, pendingHeroDecision, serializeHH, handClass, handProfitBB,
   parseActionText, normalizeActionAmounts, solveReadiness, firstToActPostflop,
   stageFromBoard, stageBoardCount, actionFlow
 } from './hand.js';
@@ -28,6 +28,11 @@ let ui = { wizTab: 'wizard', resTab: null, period: 'all', filters: { sign: 'all'
 let pendingPick = null;
 let previewResult = null;
 let toastTimer = null;
+// 实时预览：纯内存态，不写入任何持久化数据。数据保护：只读 hand，绝不修改/删除已录入内容。
+let livePreview = { key: '', status: 'idle', result: null, pct: 0, error: '' };
+let livePreviewSeq = 0;
+let livePreviewTimer = null;
+let livePreviewWorker = null;
 
 /* ---------------- 通用 UI ---------------- */
 function toast(msg) {
@@ -63,9 +68,11 @@ function render() {
     sessions: renderSessions, session: () => renderSession(id), stats: renderStats,
     library: renderLibrary, backup: renderBackup
   };
+  if (name !== 'new') stopLivePreview();
   const fn = pages[name] || renderDashboard;
   try { fn(); } catch (e) { showFatal(e); }
   postRender(name, id);
+  if (name === 'new') scheduleLivePreview();
 }
 window.addEventListener('hashchange', render);
 
@@ -176,6 +183,9 @@ function selectedDecisionIndex(h) {
   const stage = (wizard && wizard.stage) || stageFromBoard((h.board || []).length);
   const si = STREETS.indexOf(stage);
   const acts = h.actions || [];
+  // 牌谱以对手下注结束、轮到 Hero 应对 → 默认复盘这个「还没录入的下一步」
+  const pend = pendingHeroDecision(h);
+  if (pend && (wizard == null || wizard.decisionIndex == null || wizard.decisionIndex === pend.index || wizard.decisionIndex >= acts.length)) return pend.index;
   const onStage = heroDecisionIndices(h).filter(i => STREETS.indexOf(String(acts[i].street).toUpperCase()) === si);
   if (!onStage.length) return acts.length; // 该街尚未行动 → 复盘「还没行动的这一步」
   return wizard && onStage.includes(wizard.decisionIndex) ? wizard.decisionIndex : onStage[onStage.length - 1];
@@ -478,17 +488,177 @@ function tableHtml(h, street, actor, live) {
     </div>`;
   }).join('');
   const boardN = stageBoardCount(street);
-  const board = boardN === 0 ? '' : (h.board || []).filter(c => c != null).slice(0, boardN).map(c => `<span class="mini-card ${isRed(c) ? 'red' : ''}">${cardLabel(c)}</span>`).join('');
+  // 公共牌选择已并入牌桌中央：每个槽可点击选牌，前一街的牌自动保留。
+  // 数据保护：仅通过 pickCard 局部写入 h.board[idx]，不触碰手牌/行动/范围/台账。
+  const boardHtml = boardN === 0
+    ? '<span class="tiny board-empty">翻前 · 无需公共牌</span>'
+    : boardRowForTable(h, boardN);
   return `<div class="table-wrap-v">
     <div class="felt">${seats}
       <div class="felt-center">
         <div class="pot"><span>底池</span><b>${fmt(live.pot ?? 0, 1)}</b><span>BB</span></div>
-        <div class="felt-board">${board || `<span class="tiny muted">${boardN === 0 ? '翻前 · 暂无公共牌' : '未选公共牌'}</span>`}</div>
-        <div class="felt-street">${STREET_NAME[street] || street}</div>
+        <div class="felt-board">${boardHtml}</div>
+        <div class="felt-street">${STREET_NAME[street] || street}${boardN > 0 ? ' · 点击牌位选公共牌' : ''}</div>
       </div>
     </div>
-    <div class="table-legend"><span><i class="dot hero"></i>Hero</span><span><i class="dot villain"></i>对手</span><span><i class="dot folded"></i>其它位置默认弃牌</span><span><i class="dot active"></i>当前行动者（唯一亮起）</span><span class="tiny">点 Hero / 对手座位可手动指定行动者</span></div>
+    <div class="table-legend"><span><i class="dot hero"></i>Hero</span><span><i class="dot villain"></i>对手</span><span><i class="dot folded"></i>其它位置默认弃牌</span><span><i class="dot active"></i>当前行动者（唯一亮起）</span><span class="tiny">点 Hero / 对手座位可指定行动者 · 点牌桌中央牌位选公共牌</span></div>
   </div>`;
+}
+/** 牌桌中央的公共牌槽：复用选牌弹窗，按序填充；与独立公共牌卡片共用同一份 h.board 数据 */
+function boardRowForTable(h, n) {
+  const arr = (h.board || []).slice(0, n);
+  const len = (h.board || []).filter(c => c != null).length;
+  const filled = arr.filter(c => c != null).length;
+  const slots = Array.from({ length: n }, (_, i) => {
+    const c = arr[i];
+    const pending = c == null && i > len;
+    const label = c != null ? cardLabel(c) : '+';
+    return `<button class="card-slot felt-slot ${c != null && isRed(c) ? 'red' : ''} ${pending ? 'pending' : ''} ${c != null ? 'filled' : ''}"
+      data-act="pickCard" data-kind="board" data-idx="${i}" title="${pending ? '请先选前面的牌' : c != null ? '点击更换这张公共牌' : '点击选择公共牌'}">${esc(label)}</button>`;
+  }).join('');
+  const badge = filled >= n ? '<span class="board-done">✓ 已选齐</span>' : `<span class="board-need">${n - filled} 张待选</span>`;
+  return `<div class="felt-board-row">${slots}<span class="board-badge">${badge}</span></div>`;
+}
+
+/* ---------- 实时求解动态展示（录入阶段随选择即时刷新，纯内存态） ---------- */
+/**
+ * 数据保护：本模块只读 wizard.hand 生成求解请求，结果仅存于内存 livePreview；
+ * 不调用 upsertHand / upsertJob / persist，不写 IndexedDB / localStorage，不改任何已录入字段。
+ */
+function liveReqKey(h, street) {
+  if (!h) return '';
+  const bn = (h.board || []).filter(c => c != null).length;
+  if (bn === 1 || bn === 2) return 'incomplete'; // 翻牌未选齐，无法求解
+  const need = stageBoardCount(street);
+  const board = need === 0 ? [] : (h.board || []).filter(c => c != null).slice(0, need);
+  const di = selectedDecisionIndex(h);
+  return JSON.stringify({
+    board, hero: h.heroCards, villain: h.villainCards, dead: h.deadCards,
+    heroRange: h.rangePresets?.hero, villainRange: h.rangePresets?.villain,
+    pot: h.potOverrideBB, stack: h.stackOverrideBB, stackBB: h.stackBB,
+    sizes: h.sizes, mode: h.mode, archetype: h.archetype, intensity: h.intensity,
+    di, street, positions: h.positions, tableSize: h.tableSize, actions: (h.actions || []).length
+  });
+}
+function liveSolvePanelHtml(h, street) {
+  const need = stageBoardCount(street);
+  const have = (h.board || []).filter(c => c != null).length;
+  const key = liveReqKey(h, street);
+  let body;
+  if (key === 'incomplete') {
+    body = `<div class="live-msg">正在选公共牌：还需 ${3 - have} 张即可实时预览翻牌局面</div>`;
+  } else if (livePreview.status === 'error') {
+    body = `<div class="live-msg err">预览不可用：${esc(livePreview.error)}（不影响正式求解）</div>`;
+  } else if (livePreview.status === 'solving' || livePreview.status === 'queued') {
+    body = `<div class="live-msg"><span class="live-spin"></span> 正在计算实时策略 · ${Math.round(livePreview.pct * 100)}%</div>
+      <div class="progress" style="margin-top:6px"><i style="width:${(livePreview.pct * 100).toFixed(0)}%"></i></div>`;
+  } else if (livePreview.status === 'done' && livePreview.result && livePreview.key === key) {
+    const r = livePreview.result;
+    const acts = (r.actions || []).slice();
+    const maxF = Math.max(0.0001, ...acts.map(a => a.freq));
+    const bestEV = Math.max(0, ...acts.map(a => a.ev));
+    body = `<div class="live-head"><span class="live-node">${esc(r.decisionNode || '')}</span><span class="tiny muted">底池 ${fmt(r.pot, 1)} BB · ${r.iterations} 次迭代</span></div>
+      <div class="live-bars">${acts.map((a, i) => `<div class="live-row ${a.ev >= bestEV - 1e-9 ? 'best' : ''}">
+        <span class="live-act">${esc(a.label || a.type)}</span>
+        <div class="live-track"><i style="width:${(a.freq / maxF * 100).toFixed(0)}%;animation-delay:${(i * 40)}ms"></i></div>
+        <span class="live-freq">${(a.freq * 100).toFixed(0)}%</span>
+        <span class="live-ev ${pnlCls(a.ev)}">${a.ev >= 0 ? '+' : ''}${fmt(a.ev)}</span>
+      </div>`).join('')}</div>`;
+  } else if (livePreview.status === 'unsupported') {
+    body = `<div class="live-msg">当前环境不支持后台线程，实时预览已停用（不影响正式求解）</div>`;
+  } else {
+    body = `<div class="live-msg muted-t">策略将随公共牌 / 动作 / 参数选择自动刷新</div>`;
+  }
+  return `<div class="card live-card"><div class="card-title"><h2>实时策略预览</h2>
+    <span class="live-badge ${livePreview.status}" id="liveBadge">${{ idle: '待命', queued: '排队', solving: '求解中', done: '已就绪', error: '不可用', unsupported: '停用' }[livePreview.status] || livePreview.status}</span></div>
+    <div class="live-body" id="liveBodyWrap">${body}</div>
+    <div class="tiny muted" style="margin-top:6px">随每次选择即时重算（低迭代快解，仅用于交互反馈；正式结果以「开始解算」为准）。数据只读取当前录入内容，不写入也不覆盖已有数据。</div>
+  </div>`;
+}
+/** 调度实时预览：debounce + 序号防竞态；只在新建向导第 2 步触发 */
+function scheduleLivePreview() {
+  const { name } = routeInfo();
+  if (name !== 'new' || !wizard || wizard.step !== 2) return;
+  const h = wizard.hand, street = actStreet(h);
+  const key = liveReqKey(h, street);
+  if (key === 'incomplete') {
+    livePreview = { key: 'incomplete', status: 'idle', result: null, pct: 0, error: '' };
+    const box = $('#liveBody');
+    if (box) box.outerHTML = ''; // 由下一次 render 重建占位
+    return;
+  }
+  if (key === livePreview.key && (livePreview.status === 'done' || livePreview.status === 'solving' || livePreview.status === 'queued')) return;
+  livePreview = { key, status: 'queued', result: null, pct: 0.02, error: '' };
+  clearTimeout(livePreviewTimer);
+  livePreviewTimer = setTimeout(() => runLivePreview(key), 220);
+}
+function runLivePreview(key) {
+  if (livePreview.key !== key || !wizard) return;
+  const h = wizard.hand, street = actStreet(h);
+  const req = buildSolveReq(h, selectedDecisionIndex(h));
+  req.iterations = 70; req.preset = 'fast'; // 低迭代，保证交互流畅
+  const seq = ++livePreviewSeq;
+  const finishWorker = () => { if (livePreviewWorker) { try { livePreviewWorker.terminate(); } catch (e) {} livePreviewWorker = null; } };
+  if (typeof Worker === 'undefined') {
+    livePreview = { key, status: 'unsupported', result: null, pct: 0, error: '' };
+    render(); return;
+  }
+  finishWorker();
+  let w;
+  try { w = new Worker(new URL('./solver.worker.js', import.meta.url), { type: 'module' }); }
+  catch (e) { finishWorker(); livePreview = { key, status: 'error', result: null, pct: 0, error: '无法启动后台线程' }; render(); return; }
+  livePreviewWorker = w;
+  w.onmessage = ev => {
+    const m = ev.data || {};
+    if (seq !== livePreviewSeq) return; // 过期结果丢弃
+    if (m.type === 'progress') {
+      if (livePreview.status !== 'done') { livePreview.status = 'solving'; livePreview.pct = m.pct; updateLiveBody(); }
+    } else if (m.type === 'result') {
+      livePreview = { key, status: 'done', result: m.result, pct: 1, error: '' };
+      finishWorker(); updateLiveBody();
+    } else if (m.type === 'error') {
+      livePreview = { key, status: 'error', result: null, pct: 0, error: m.message || '未知错误' };
+      finishWorker(); updateLiveBody();
+    }
+  };
+  w.onerror = () => { if (seq === livePreviewSeq) { livePreview = { key, status: 'error', result: null, pct: 0, error: '后台线程异常' }; finishWorker(); updateLiveBody(); } };
+  w.postMessage({ type: 'solve', jobId: 'live-' + seq, req });
+}
+/** 仅刷新实时面板 DOM，避免整页 render 打断输入焦点 */
+function updateLiveBody() {
+  const h = wizard && wizard.hand, street = h && actStreet(h);
+  if (!h) return;
+  const wrap = $('#liveBodyWrap');
+  if (!wrap) { return; }
+  const need = stageBoardCount(street), have = (h.board || []).filter(c => c != null).length;
+  const key = liveReqKey(h, street);
+  let body;
+  if (livePreview.status === 'solving' || livePreview.status === 'queued') {
+    body = `<div class="live-msg"><span class="live-spin"></span> 正在计算实时策略 · ${Math.round(livePreview.pct * 100)}%</div>
+      <div class="progress" style="margin-top:6px"><i style="width:${(livePreview.pct * 100).toFixed(0)}%"></i></div>`;
+  } else if (livePreview.status === 'done' && livePreview.result && livePreview.key === key) {
+    const r = livePreview.result, acts = (r.actions || []).slice();
+    const maxF = Math.max(0.0001, ...acts.map(a => a.freq));
+    const bestEV = Math.max(0, ...acts.map(a => a.ev));
+    body = `<div class="live-head"><span class="live-node">${esc(r.decisionNode || '')}</span><span class="tiny muted">底池 ${fmt(r.pot, 1)} BB · ${r.iterations} 次迭代</span></div>
+      <div class="live-bars">${acts.map((a, i) => `<div class="live-row ${a.ev >= bestEV - 1e-9 ? 'best' : ''}">
+        <span class="live-act">${esc(a.label || a.type)}</span>
+        <div class="live-track"><i style="width:${(a.freq / maxF * 100).toFixed(0)}%;animation-delay:${(i * 40)}ms"></i></div>
+        <span class="live-freq">${(a.freq * 100).toFixed(0)}%</span>
+        <span class="live-ev ${pnlCls(a.ev)}">${a.ev >= 0 ? '+' : ''}${fmt(a.ev)}</span>
+      </div>`).join('')}</div>`;
+  } else if (livePreview.status === 'error') {
+    body = `<div class="live-msg err">预览不可用：${esc(livePreview.error)}（不影响正式求解）</div>`;
+  }
+  if (body) wrap.innerHTML = body;
+  const badge = $('#liveBadge');
+  if (badge) { badge.className = 'live-badge ' + livePreview.status; badge.textContent = { idle: '待命', queued: '排队', solving: '求解中', done: '已就绪', error: '不可用', unsupported: '停用' }[livePreview.status] || livePreview.status; }
+}
+/** 停止实时预览（进入正式求解 / 离开向导时调用），不触碰持久化数据 */
+function stopLivePreview() {
+  clearTimeout(livePreviewTimer);
+  livePreviewSeq++;
+  if (livePreviewWorker) { try { livePreviewWorker.terminate(); } catch (e) {} livePreviewWorker = null; }
 }
 
 /* ---------- 行动卡片 ---------- */
@@ -553,11 +723,16 @@ function actionCardsHtml(h, live, toCall, street, flow) {
 /* ---------- 行动时间线 ---------- */
 function timelineHtml(h, idxs, di) {
   const acts = h.actions || [];
-  if (!acts.length) return '<div class="empty">还没有录入行动 · 点击上方卡片即录入一条</div>';
+  const pend = pendingHeroDecision(h);
+  if (!acts.length && !pend) return '<div class="empty">还没有录入行动 · 点击上方卡片即录入一条</div>';
   return STREETS.map(st => {
     const items = acts.map((a, i) => ({ a, i })).filter(x => String(x.a.street).toUpperCase() === st);
-    if (!items.length) return '';
-    return `<div class="tl-street"><div class="tl-hd"><b>${STREET_NAME[st]}</b><span class="tiny muted">${items.length} 条</span></div>
+    const pendHere = pend && pend.street === st;
+    if (!items.length && !pendHere) return '';
+    const pendHtml = pendHere ? `<button class="tl-pill pending-hero ${pend.index === di ? 'on' : ''}" data-act="setPendingDecision" data-v="${pend.index}" title="牌谱停在对手下注：这是 Hero 尚未应对的决策点，点此设为解算点">
+        <span class="no">下一步</span><span class="who">HERO</span><span class="what">待应对 ${fmt(pend.toCall, 1)} BB</span><span class="flag">决策点</span>
+      </button>` : '';
+    return `<div class="tl-street"><div class="tl-hd"><b>${STREET_NAME[st]}</b><span class="tiny muted">${items.length} 条${pendHere ? ' · 1 待决策' : ''}</span></div>
       <div class="tl-row">${items.map(({ a, i }) => {
         const isDecision = idxs.includes(i);
         const side = actorKey(h, a.actor) === 'HERO' ? 'hero' : actorKey(h, a.actor) === 'VILLAIN' ? 'villain' : 'other';
@@ -566,7 +741,7 @@ function timelineHtml(h, idxs, di) {
           ${a.amountBB != null ? `<b>${fmt(a.amountBB, 1)}</b>` : ''}
           ${a.auto ? '<span class="flag auto">默认</span>' : ''}${isDecision ? '<span class="flag">决策点</span>' : ''}
         </button>`;
-      }).join('')}</div></div>`;
+      }).join('')}${pendHtml}</div></div>`;
   }).join('');
 }
 
@@ -607,17 +782,10 @@ function wizardStep2(h, di, v, rd) {
       <span>${need === 0 ? '无需公共牌' : `需 ${need} 张公共牌`}${done ? ' ✓' : ''}</span></button>`;
   }).join('');
   const nextSt = si < 3 ? STREETS[si + 1] : null;
-  const boardCard = boardNeed === 0 ? '' : `<div class="card stage-board-card">
-    <div class="card-title"><h2>${STREET_NAME[street]}公共牌</h2>
-      <span class="tiny ${boardNow >= boardNeed ? 'ready-ok' : 'ready-no'}">${boardNow >= boardNeed ? `✓ 已选齐 ${boardNeed} 张` : `还差 ${boardNeed - boardNow} 张`} · 点击 + 选择</span></div>
-    ${cardRowHtml(h.board, 'board', boardNeed)}
-    <div class="tiny muted" style="margin-top:6px">前一街已选的公共牌自动保留；翻前阶段不显示此区。</div>
-  </div>`;
 
   return `<div class="card"><div class="card-title"><h2>③ 选择行动</h2><span class="tiny muted">已录入 ${acts.length} 条 · 点卡片即录入</span></div>
     ${readinessStrip(rd)}
     <div class="stage-nav">${stageNav}</div>
-    ${boardCard}
     <div class="stage-actions">
       ${nextSt ? `<button class="btn primary" data-act="advanceStage">下一步：${STREET_NAME[nextSt]} →</button>` : '<span class="tiny muted">已到河牌，可直接解算</span>'}
       ${si > 0 && boardNow < boardNeed ? `<button class="btn sm" data-act="solveStreet" data-v="${STREETS[si - 1]}" title="切换回上一街并解算该街的 Hero 决策">先解算${STREET_NAME[STREETS[si - 1]]}</button>` : ''}
@@ -639,6 +807,7 @@ function wizardStep2(h, di, v, rd) {
       ${ui.act.actor ? '<button class="btn sm" data-act="resetActor">自动顺位</button>' : ''}
     </div>
     ${tableHtml(h, street, actor, live)}
+    ${liveSolvePanelHtml(h, street)}
     ${actionCardsHtml(h, live, toCall, street, flow)}
     ${closed ? '' : `<details class="adv-amt"><summary>自定义金额（可选）</summary>
       <div class="row" style="margin-top:6px"><input type="number" id="naAmount" step="0.1" min="0" placeholder="输入 BB 数，然后点上方「自定义」">
@@ -705,6 +874,7 @@ function beginSolve() {
   if (!wizard) return;
   const rd = solveReadiness(wizard.hand, wizard.stage);
   if (!rd.ready) { openReadiness(rd); return; }
+  stopLivePreview();
   submitSolve(wizard.hand, selectedDecisionIndex(wizard.hand));
 }
 function sizeChips(h) {
@@ -776,6 +946,7 @@ function renderResult(id) {
   const maxFreq = Math.max(0.0001, ...shown.actions.map(a => a.freq));
   const bestEV = Math.max(...shown.actions.map(a => a.ev));
   const idxs = heroDecisionIndices(h);
+  const pend = pendingHeroDecision(h);
   app.innerHTML = `
   <div class="page-head"><div><h1>求解结果</h1><p class="sub">${esc(r.decisionNode || '')} · 底池 ${fmt(r.pot, 1)} BB · 后手 ${fmt(r.stacks, 1)} BB</p></div>
     <div class="row"><button class="btn sm" data-act="resCopy" data-id="${esc(job.id)}">复制牌谱</button><button class="btn sm" data-act="resPNG" data-id="${esc(job.id)}">导出图片</button></div></div>
@@ -787,6 +958,8 @@ function renderResult(id) {
   <div class="card"><h2>行动回放与决策点</h2><div class="action-list">
     ${(h.actions || []).length ? h.actions.map((a, i) => `<div class="action-item ${idxs.includes(i) ? 'click' : ''} ${i === job.params.decisionIndex ? 'on' : ''}" ${idxs.includes(i) ? `data-act="resDecision" data-id="${esc(job.id)}" data-v="${i}"` : ''}>
       <span class="st">${esc(String(a.street).slice(0, 4))}</span><span class="ac">${esc(formatAction(a))}</span>${i === job.params.decisionIndex ? '<span class="tag">当前</span>' : ''}</div>`).join('') : '<div class="empty">无行动记录</div>'}
+    ${pend ? `<div class="action-item click ${pend.index === job.params.decisionIndex ? 'on' : ''}" data-act="resDecision" data-id="${esc(job.id)}" data-v="${pend.index}">
+      <span class="st">下一步</span><span class="ac">Hero 待应对 ${fmt(pend.toCall, 1)} BB</span>${pend.index === job.params.decisionIndex ? '<span class="tag">当前</span>' : ''}</div>` : ''}
   </div><div class="tiny muted" style="margin-top:6px">点击 Hero 决策可切换复盘节点（重新求解）</div></div>
   <div class="card"><div class="card-title"><h2>${tab === 'exploit' ? '剥削路线输出' : '均衡输出'}</h2><span class="pill">EV 单位：BB</span></div>
     <div class="table-wrap"><table class="ev-table"><thead><tr><th>动作</th><th class="num">${tab === 'exploit' ? '剥削频率' : '均衡频率'}</th><th class="num">动作 EV</th><th>标签</th></tr></thead><tbody>
@@ -1051,7 +1224,7 @@ function handleBind(target) {
   saveDraft(h);
 }
 function saveWizard() { if (wizard) saveDraft(wizard.hand); }
-function refresh() { saveWizard(); render(); }
+function refresh() { saveWizard(); render(); scheduleLivePreview(); }
 
 function refocus(id, value) {
   const el = $('#' + id);
@@ -1158,11 +1331,28 @@ function handleAct(act, ds, ev) {
       if (arr && p.idx > arr.length) { toast('请按顺序先选择前面的牌'); break; }
       const all = [...h.heroCards, ...h.villainCards, ...h.board, ...h.deadCards];
       if (all.includes(c)) { toast('该牌已被使用，请选择其他牌'); break; }
+      // 记录选牌前当前街已填公共牌数，用于判断「刚选齐最后一张」
+      const street0 = actStreet(h), need0 = stageBoardCount(street0);
+      const beforeFilled = (h.board || []).filter(x => x != null).slice(0, need0).length;
       if (p.kind === 'hero') h.heroCards[p.idx] = c;
       else if (p.kind === 'villain') h.villainCards[p.idx] = c;
       else if (p.kind === 'board') h.board[p.idx] = c;
       else h.deadCards.push(c);
-      closeModal(); refresh(); break;
+      closeModal();
+      // 公共牌刚选齐当前街最后一张 → 自动进入下一街（仅 UI 阶段推进，不改动任何已录入数据）
+      let advanced = false;
+      if (p.kind === 'board' && need0 > 0 && beforeFilled === need0 - 1) {
+        const afterFilled = (h.board || []).filter(x => x != null).slice(0, need0).length;
+        const si0 = STREETS.indexOf(wizard.stage);
+        if (afterFilled >= need0 && si0 >= 0 && si0 < 3) {
+          wizard.stage = STREETS[si0 + 1];
+          ui.act.actor = null; ui.act.force = false; wizard.decisionIndex = null;
+          advanced = true;
+        }
+      }
+      refresh();
+      if (advanced) toast(`${STREET_NAME[street0]}公共牌已选齐 · 自动进入${STREET_NAME[wizard.stage]}`);
+      break;
     }
     case 'clearCard': {
       const h = wizard.hand, p = pendingPick;
@@ -1341,6 +1531,9 @@ function handleAct(act, ds, ev) {
       if (el && ev.target !== el && ev.target.closest('button,input')) break;
       closeModal();
       wizard.decisionIndex = Number(v); refresh(); toast(`决策点已切换为 #${Number(v) + 1}`); break;
+    }
+    case 'setPendingDecision': {
+      wizard.decisionIndex = Number(v); refresh(); toast('决策点已设为：Hero 面对对手下注的应对'); break;
     }
     case 'toggleSize': {
       const h = wizard.hand, n = Number(v);
