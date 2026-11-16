@@ -7,7 +7,7 @@ import {
   parseHH, validateHand, deriveState, serializeHH, defaultHand, heroDecisionIndices,
   handProfitBB, handClass, positionsFor, parseActionText, normalizeActionAmounts,
   postflopOrder, firstToActPostflop, heroIsOOP, solveReadiness,
-  stageFromBoard, stageBoardCount
+  stageFromBoard, stageBoardCount, actionFlow
 } from '../js/hand.js';
 import { solveCore, previewCore, ARCHETYPE_PARAMS } from '../js/solver-core.js';
 import {
@@ -297,6 +297,67 @@ console.log('\n[8] 翻前场景（board = 0）');
   ok('翻前口径已标注为近似', /翻前近似/.test(pre.convergenceNote));
   const pvPre = previewCore(makeReq({ board: [], iterations: 20, facingBet: 1, oppChecked: false }), '跟注', () => {});
   ok('翻前路线预览一次补齐 3 张翻牌', pvPre.available === true && pvPre.street === 'FLOP' && pvPre.board.length === 3, JSON.stringify({ available: pvPre.available, street: pvPre.street, board: pvPre.board }));
+}
+
+console.log('\n[9] 行动流顺位与街结束判定（V1.4）');
+{
+  const h = defaultHand();
+  h.heroCards = C('As', 'Kd');
+  const f0 = actionFlow(h, 'PREFLOP');
+  ok('翻前首位为两家中最靠前的位置（BTN）', f0.actor === 'BTN', String(f0.actor));
+  ok('翻前根局面待跟注 1BB 且未结束', f0.toCall === 1 && f0.closed === false, JSON.stringify({ toCall: f0.toCall, closed: f0.closed }));
+  ok('仅 Hero 与对手两家参与顺位', f0.live.length === 2 && f0.live.includes('BTN') && f0.live.includes('BB'));
+
+  h.actions = [{ street: 'PREFLOP', actor: 'BB', type: 'RAISE_TO', amountBB: 5 }];
+  const f1 = actionFlow(h, 'PREFLOP');
+  ok('对手加注后轮到 Hero', f1.actor === 'BTN' && !f1.closed, JSON.stringify({ actor: f1.actor, closed: f1.closed }));
+  ok('加注后待跟注额为 5BB', f1.toCall === 5, String(f1.toCall));
+  h.actions.push({ street: 'PREFLOP', actor: 'BTN', type: 'CALL', amountBB: 5 });
+  const f2 = actionFlow(h, 'PREFLOP');
+  ok('Hero 跟注加注后本街结束且无下一位', f2.closed === true && f2.actor === null, JSON.stringify({ closed: f2.closed, actor: f2.actor }));
+  ok('本街结束后待跟注归零', f2.toCall === 0, String(f2.toCall));
+
+  const hf = defaultHand();
+  hf.heroCards = C('As', 'Kd');
+  hf.actions = [
+    { street: 'PREFLOP', actor: 'BB', type: 'RAISE_TO', amountBB: 5 },
+    { street: 'PREFLOP', actor: 'BTN', type: 'FOLD', amountBB: null }
+  ];
+  const ff = actionFlow(hf, 'PREFLOP');
+  ok('有人弃牌 → 本手结束，不再顺位', ff.closed && ff.handOver && ff.actor === null);
+
+  const hp = defaultHand();
+  hp.heroCards = C('As', 'Kd');
+  hp.board = C('Kc', '7h', '2s');
+  hp.actions = [{ street: 'FLOP', actor: 'BB', type: 'CHECK', amountBB: null }];
+  const fp1 = actionFlow(hp, 'FLOP');
+  ok('翻后首动为 OOP（BB），单人过牌不结束', fp1.first === 'BB' && fp1.actor === 'BTN' && !fp1.closed, JSON.stringify({ first: fp1.first, actor: fp1.actor, closed: fp1.closed }));
+  hp.actions.push({ street: 'FLOP', actor: 'BTN', type: 'CHECK', amountBB: null });
+  const fp2 = actionFlow(hp, 'FLOP');
+  ok('双方过牌 → 本街结束', fp2.closed && fp2.actor === null);
+
+  const hb = defaultHand();
+  hb.heroCards = C('As', 'Kd');
+  hb.board = C('Kc', '7h', '2s');
+  hb.actions = [{ street: 'FLOP', actor: 'BB', type: 'BET', amountBB: 3.3 }];
+  ok('翻后下注未跟注时本街未结束', !actionFlow(hb, 'FLOP').closed && actionFlow(hb, 'FLOP').actor === 'BTN');
+  hb.actions.push({ street: 'FLOP', actor: 'BTN', type: 'CALL', amountBB: 3.3 });
+  ok('下注被跟注 → 本街结束（可自动进转牌）', actionFlow(hb, 'FLOP').closed && actionFlow(hb, 'FLOP').actor === null);
+
+  const ho = defaultHand();
+  ho.heroCards = C('As', 'Kd');
+  ho.actions = ['UTG', 'MP', 'CO', 'SB'].map(actor => ({ street: 'PREFLOP', actor, type: 'FOLD', amountBB: null }));
+  const fo = actionFlow(ho, 'PREFLOP');
+  ok('其它位置默认弃牌不改变行动顺位', fo.actor === 'BTN' && !fo.closed, String(fo.actor));
+
+  const hl = defaultHand();
+  hl.heroCards = C('As', 'Kd');
+  hl.positions = { hero: 'BB', villain: 'BTN' };
+  hl.actions = [{ street: 'PREFLOP', actor: 'BTN', type: 'CALL', amountBB: 1 }];
+  const fl = actionFlow(hl, 'PREFLOP');
+  ok('翻前跛入后轮到大盲、待跟注归零（大盲期权）', fl.actor === 'BB' && fl.toCall === 0 && !fl.closed, JSON.stringify({ actor: fl.actor, toCall: fl.toCall, closed: fl.closed }));
+  hl.actions.push({ street: 'PREFLOP', actor: 'BB', type: 'CHECK', amountBB: null });
+  ok('大盲过牌后本街结束', actionFlow(hl, 'PREFLOP').closed === true);
 }
 
 console.log(`\n结果：${pass} 通过 / ${fail} 失败\n`);

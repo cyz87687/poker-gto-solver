@@ -292,6 +292,89 @@ export function validateHand(hand) {
   return { ok: errors.length === 0, errors, warnings, solveAllowed, potTrace, computedPotBB: Math.round(pot * 10) / 10, live, otherActors: others };
 }
 
+/**
+ * 行动流推导（V1.4）：当前街由谁行动、待跟注额、本街是否已结束。
+ * 规则：
+ *  - 翻前除 Hero / 对手外的位置一律视为「默认弃牌」，不参与行动顺位；
+ *  - 翻后仅 Hero 与对手两家交替（首位由位置决定，OOP 先动）；
+ *  - 本街结束 = 有人弃牌 / 最后一次下注被跟注 / 双方都过牌 / 双方全下。
+ * 返回 { actor, closed, handOver, closedReason, pot, toCall, highest, lastRaise, live, facing, first, v }。
+ */
+export function actionFlow(hand, street) {
+  const st = String(street || 'PREFLOP').toUpperCase();
+  const si = STREETS.indexOf(st);
+  const v = validateHand(hand);
+  const traces = v.potTrace || [];
+  const onStreet = traces.filter(t => t.street === st);
+  const prev = traces.filter(t => STREETS.indexOf(t.street) < si);
+  const sb = num(hand.stakes?.sb) || 1, bb = num(hand.stakes?.bb) || 2;
+  const blinds = sb / bb + 1;
+  const basePot = prev.length ? prev[prev.length - 1].pot : blinds;
+  const last = onStreet[onStreet.length - 1];
+  const pot = last ? last.pot : Math.round(basePot * 10) / 10;
+  const toCall = last ? last.toCall : (si === 0 ? 1 : 0);
+  const highest = last ? last.highest : (si === 0 ? 1 : 0);
+  const lastRaise = last ? last.lastRaise : 1;
+
+  const hero = String(hand.positions?.hero || 'BTN').toUpperCase();
+  const villain = String(hand.positions?.villain || 'BB').toUpperCase();
+  const live = [...new Set([hero, villain])];
+  const keyOf = a => {
+    const u = String(a || '').toUpperCase();
+    if (u === hero || u === 'HERO') return 'HERO';
+    if (u === villain || u === 'VILLAIN') return 'VILLAIN';
+    return 'OTHER';
+  };
+  const order = (si === 0 ? positionsFor(hand.tableSize) : postflopOrder(hand.tableSize)).map(p => String(p).toUpperCase());
+  const rank = p => { const i = order.indexOf(p); return i < 0 ? 99 : i; };
+  const first = live.slice().sort((a, b) => rank(a) - rank(b))[0];
+
+  const allActs = hand.actions || [];
+  const acts = allActs.filter(a => String(a.street || '').toUpperCase() === st);
+  const folded = new Set(), acted = new Set(), responded = new Set();
+  let lastAgg = null, handOver = false;
+  // 之前街若 Hero / 对手已弃牌，本手即结束
+  for (const a of allActs) {
+    if (STREETS.indexOf(String(a.street || '').toUpperCase()) >= si) break;
+    if (a.type === 'FOLD' && keyOf(a.actor) !== 'OTHER') { folded.add(keyOf(a.actor)); handOver = true; }
+  }
+  for (const a of acts) {
+    const k = keyOf(a.actor);
+    if (k === 'OTHER') continue;              // 其它位置默认弃牌，不参与顺位
+    acted.add(k);
+    if (a.type === 'FOLD') { folded.add(k); responded.add(k); handOver = true; continue; }
+    if (a.type === 'BET' || a.type === 'RAISE_TO' || a.type === 'ALLIN') { lastAgg = k; responded.clear(); }
+    else if (lastAgg === null) acted.add(k);
+    else if (k !== lastAgg) responded.add(k);
+  }
+  const need = live.filter(p => !folded.has(keyOf(p)));
+  let closed = false, closedReason = '';
+  if (handOver) { closed = true; closedReason = '本手已有一方弃牌'; }
+  else if (lastAgg) {
+    closed = need.every(p => keyOf(p) === lastAgg || responded.has(keyOf(p)));
+    if (closed) closedReason = '下注已被跟注，本街行动结束';
+  } else {
+    closed = need.every(p => acted.has(keyOf(p)));
+    if (closed) closedReason = '双方均已行动，本街结束';
+  }
+  if (!handOver && acts.some(a => a.type === 'ALLIN' && keyOf(a.actor) !== 'OTHER') && toCall === 0) {
+    closed = true; closedReason = '双方全下，后续自动发牌';
+  }
+  const lastLive = [...acts].reverse().find(a => keyOf(a.actor) !== 'OTHER');
+  let actor = null;
+  if (!closed) {
+    if (lastLive) {
+      const k = keyOf(lastLive.actor);
+      actor = live.find(p => keyOf(p) !== k && !folded.has(keyOf(p))) || first;
+    } else actor = first;
+  }
+  return {
+    street: st, actor, first, closed, handOver, closedReason,
+    pot, toCall: Math.max(0, toCall), highest, lastRaise,
+    live, folded: [...folded], facing: toCall > 0, v
+  };
+}
+
 /** 按已录入公共牌数推断当前所处的街阶段 */
 export function stageFromBoard(n) {
   return n >= 5 ? 'RIVER' : n >= 4 ? 'TURN' : n >= 3 ? 'FLOP' : 'PREFLOP';

@@ -4,7 +4,7 @@ import {
   STREETS, POS6, POS9, ACTION_TYPES, BUILTIN_TAGS, ARCHETYPES, positionsFor, makeId, defaultHand,
   formatAction, parseHH, validateHand, deriveState, heroDecisionIndices, serializeHH, handClass, handProfitBB,
   parseActionText, normalizeActionAmounts, solveReadiness, firstToActPostflop,
-  stageFromBoard, stageBoardCount
+  stageFromBoard, stageBoardCount, actionFlow
 } from './hand.js';
 import {
   initDB, state, commit, persist, saveDraft, clearDraft, upsertSession, removeSession, upsertHand, removeHand,
@@ -348,7 +348,7 @@ function wizardStep1(h) {
     <label class="field" style="margin-top:8px"><span>死牌 Dead Cards（可选，如 As Kd）</span><input type="text" data-bind="deadText" value="${esc((h.deadCards || []).map(cardStr).join(' '))}" placeholder="已知弃牌，空格分隔"></label>
     <label class="field" style="margin-top:8px"><span>摊牌结果</span><select data-bind="result"><option value="" ${!h.result ? 'selected' : ''}>未录入</option><option value="hero" ${h.result === 'hero' ? 'selected' : ''}>我方赢</option><option value="villain" ${h.result === 'villain' ? 'selected' : ''}>对方赢</option><option value="split" ${h.result === 'split' ? 'selected' : ''}>平分底池</option></select></label>
   </div>
-  <div class="notice info">默认从<b>翻前</b>开始：无需选公共牌，录完手牌与翻前行动即可解算。点第 2 步的「下一步：翻牌」后，才需要选择 3 张公共牌；转牌 / 河牌逐街追加。翻后仅支持 Hero 与对手两家。</div>`;
+  <div class="notice info">默认从<b>翻前</b>开始：无需选公共牌，录完手牌与翻前行动即可解算。点第 2 步的「下一步：翻牌」后，才需要选择 3 张公共牌；转牌 / 河牌逐街追加。<br>已选定的 Hero 与对手位置即本手唯二参与行动的位置，<b>其余位置翻前默认弃牌</b>，行动页无需逐一录入；翻后仅支持这两家。</div>`;
 }
 /* ---------------- 行动流：可视化行动选择器 ---------------- */
 const ACTION_LABEL = { FOLD: '弃牌', CHECK: '过牌', CALL: '跟注', BET: '下注', RAISE_TO: '加注至', ALLIN: '全下' };
@@ -371,51 +371,22 @@ function actStreet(h) {
   const acts = h.actions || [];
   return ui.act.street || (acts.length ? String(acts[acts.length - 1].street).toUpperCase() : 'PREFLOP');
 }
-/** 下一位行动者：同街自动顺位推进；进入新街回到该街首位（翻后按位置由 OOP 先动） */
+/**
+ * 下一位行动者：由纯逻辑 actionFlow 推导（仅 Hero 与对手两家，其它位置默认弃牌）。
+ * 本街已结束时返回 null（座位不再亮起）；允许用「换人」手动覆盖。
+ */
 function nextActorFor(h, street) {
+  const f = actionFlow(h, street);
   if (ui.act.actor) return ui.act.actor;
-  const pos = positionsFor(h.tableSize);
-  const acts = h.actions || [];
-  const sameStreet = acts.filter(a => String(a.street).toUpperCase() === street);
-  const last = sameStreet[sameStreet.length - 1];
-  const si = STREETS.indexOf(street);
-  if (si > 0) {
-    // 翻后为单挑底池：只在 Hero 与 Villain 之间交替，首位由位置（OOP）决定
-    if (!last) return firstToActPostflop(h);
-    return actorKey(h, last.actor) === 'HERO' ? h.positions.villain : h.positions.hero;
-  }
-  const first = pos[0];
-  if (!last) return first;
-  const key = actorKey(h, last.actor);
-  const i = pos.findIndex(x => x.toUpperCase() === key);
-  return i >= 0 ? pos[(i + 1) % pos.length] : first;
+  return f.actor;
 }
-/** 某条街结束时的局面（用于在该街末尾补录动作，可回到前面的街） */
+/** 当前街的下注局面：与状态机同源，供行动卡片生成金额与可用态 */
 function liveFor(h, street) {
-  const v = validateHand(h);
-  const si = STREETS.indexOf(street);
-  const traces = v.potTrace || [];
-  const onStreet = traces.filter(t => t.street === street);
-  if (onStreet.length) {
-    const last = onStreet[onStreet.length - 1];
-    return {
-      v,
-      live: {
-        pot: last.pot, toCall: last.toCall,
-        highest: last.highest != null ? last.highest : 0,
-        lastRaise: last.lastRaise != null ? last.lastRaise : 1,
-        street
-      }
-    };
-  }
-  const prev = traces.filter(t => STREETS.indexOf(t.street) < si);
-  if (prev.length) {
-    return { v, live: { pot: prev[prev.length - 1].pot, toCall: 0, highest: 0, lastRaise: 1, street } };
-  }
-  const sb = Number(h.stakes?.sb) || 1, bb = Number(h.stakes?.bb) || 2;
+  const f = actionFlow(h, street);
   return {
-    v,
-    live: { pot: Math.round((sb / bb + 1) * 10) / 10, toCall: si === 0 ? 1 : 0, highest: si === 0 ? 1 : 0, lastRaise: 1, street }
+    f,
+    v: f.v,
+    live: { pot: f.pot, toCall: f.toCall, highest: f.highest, lastRaise: f.lastRaise, street }
   };
 }
 function suggestedAmounts(h, live) {
@@ -470,7 +441,8 @@ function seatCoords(h) {
   const step = 360 / rot.length;
   return rot.map((name, k) => {
     const rad = (90 + k * step) * Math.PI / 180;
-    return { name, left: 50 + 37 * Math.cos(rad), top: 50 + 33 * Math.sin(rad) };
+    // 垂直半径收窄，避免底部座位被 sticky 底栏遮挡；水平保持原有间距
+    return { name, left: 50 + 37 * Math.cos(rad), top: 50 + 28 * Math.sin(rad) };
   });
 }
 function tableHtml(h, street, actor, live) {
@@ -486,19 +458,23 @@ function tableHtml(h, street, actor, live) {
     if (a.type === 'BET' || a.type === 'CALL') inv[k] = cur + amt;
     else if (a.type === 'RAISE_TO' || a.type === 'ALLIN') inv[k] = Math.max(cur, amt);
   }
-  const actorU = String(actor || '').toUpperCase();
+  // 只有「轮到行动」的那个座位亮起；本街结束时 actor 为 null，全桌不亮
+  const activeKey = actor ? actorKey(h, actor) : null;
   const seats = seatCoords(h).map(s => {
     const key = actorKey(h, s.name);
     const side = key === 'HERO' ? 'hero' : key === 'VILLAIN' ? 'villain' : 'other';
-    const isFolded = folded.has(key);
-    const active = key === actorKey(h, actorU) || s.name === actorU;
-    const isOut = side === 'other' && isFolded;
+    const isLive = side !== 'other';
+    // 其它位置翻前默认弃牌，无需逐一录入
+    const isFolded = !isLive || folded.has(key);
+    const active = !!activeKey && key === activeKey && !isFolded;
     const amt = inv[key] || 0;
-    return `<div class="seat ${side} ${isFolded ? 'folded' : ''} ${active ? 'active' : ''} ${isOut ? 'out' : ''}"
+    const tag = side === 'hero' ? 'HERO' : side === 'villain' ? '对手' : '默认弃牌';
+    return `<div class="seat ${side} ${isLive ? 'live' : 'other'} ${isFolded ? 'folded' : ''} ${active ? 'active' : ''}"
+      ${isLive ? `data-act="setActorSeat" data-v="${esc(s.name)}" role="button" title="设为当前行动者：${esc(s.name)}"` : ''}
       style="left:${s.left.toFixed(1)}%;top:${s.top.toFixed(1)}%">
       <div class="seat-nm">${esc(s.name)}</div>
-      <div class="seat-tag">${side === 'hero' ? 'HERO' : side === 'villain' ? '对手' : isFolded ? '已弃' : '—'}${amt > 0 ? ' · ' + fmt(amt, 1) : ''}</div>
-      ${active ? '<div class="seat-act">行动中</div>' : ''}
+      <div class="seat-tag">${tag}${amt > 0 ? ' · ' + fmt(amt, 1) : ''}</div>
+      ${active ? '<div class="seat-act">● 行动中</div>' : ''}
     </div>`;
   }).join('');
   const boardN = stageBoardCount(street);
@@ -511,7 +487,7 @@ function tableHtml(h, street, actor, live) {
         <div class="felt-street">${STREET_NAME[street] || street}</div>
       </div>
     </div>
-    <div class="table-legend"><span><i class="dot hero"></i>Hero</span><span><i class="dot villain"></i>对手</span><span><i class="dot folded"></i>已弃牌</span><span><i class="dot active"></i>下一位行动</span></div>
+    <div class="table-legend"><span><i class="dot hero"></i>Hero</span><span><i class="dot villain"></i>对手</span><span><i class="dot folded"></i>其它位置默认弃牌</span><span><i class="dot active"></i>当前行动者（唯一亮起）</span><span class="tiny">点 Hero / 对手座位可手动指定行动者</span></div>
   </div>`;
 }
 
@@ -530,21 +506,48 @@ function sizeActionCard(type, title, sub, opts, dis, reason) {
       <button class="sz sz-custom" data-act="quickAction" data-v="${type}" data-amt="custom"><b>自定义</b></button></div>
   </div>`;
 }
-function actionCardsHtml(h, live, toCall) {
+/** 本街已结束：不再展示行动卡片，也不点亮任何座位，直接给出下一步 */
+function streetDoneHtml(h, street, flow) {
+  const si = STREETS.indexOf(street);
+  const nextSt = si < 3 ? STREETS[si + 1] : null;
+  return `<div class="street-done ${flow.handOver ? 'over' : ''}">
+    <div class="sd-hd"><span class="sd-ic">✓</span><div><b>${esc(flow.closedReason || '本街行动已结束')}</b>
+      <div class="small muted">底池 ${fmt(flow.pot, 1)} BB · 本街已无待行动玩家；${nextSt && !flow.handOver ? `可进入${STREET_NAME[nextSt]}或直接解算` : '可直接解算'}</div></div></div>
+    <div class="row" style="margin-top:10px">
+      ${nextSt && !flow.handOver ? `<button class="btn primary" data-act="advanceStage">下一步：${STREET_NAME[nextSt]} →</button>` : ''}
+      <button class="btn" data-act="beginSolve">开始解算 →</button>
+      <button class="btn sm" data-act="forceAct">仍要在本街补录</button>
+    </div></div>`;
+}
+function actionCardsHtml(h, live, toCall, street, flow) {
+  if (flow.closed && !ui.act.force) return streetDoneHtml(h, street, flow);
   const stack = Math.max(0, Number(h.stackBB) || 100);
   const pot = Math.max(0.5, Number(live.pot) || 1);
   const sug = suggestedAmounts(h, live);
   const facing = toCall > 0;
+  const preflop = street === 'PREFLOP';
   const callAmt = Math.min(toCall, stack);
-  const out = [];
+  const out = [], notes = [];
   out.push(simpleActionCard('FOLD', '弃牌', '放弃本手，已投入的筹码不收回', false, ''));
-  out.push(simpleActionCard('CHECK', '过牌', '不投入，把行动权交给对手', facing, '对手已下注，此时不能过牌'));
+  if (preflop && facing) {
+    // 翻前面对大盲 / 加注，规则上不存在过牌；只有大盲期权（待跟注额为 0）时才出现
+    notes.push('翻前面对大盲 / 加注时没有「过牌」选项（对手已下注，此时不能过牌），只能弃牌、跟注或加注。');
+  } else {
+    const bbOption = preflop && !facing && (h.actions || []).some(a => String(a.street).toUpperCase() === 'PREFLOP' && a.type === 'CALL');
+    out.push(simpleActionCard('CHECK', bbOption ? '过牌（大盲期权）' : '过牌',
+      bbOption ? '无人再加注，保留大盲期权直接看翻牌' : '不投入，把行动权交给对手',
+      facing, '对手已下注，此时不能过牌'));
+  }
   out.push(simpleActionCard('CALL', facing ? `跟注 ${fmt(callAmt, 1)}` : '跟注', facing ? `投入 ${fmt(callAmt, 1)} BB 匹配对手下注` : '', !facing, '无人下注，无需跟注'));
-  out.push(sizeActionCard('BET', '下注', `主动投入 · 底池 ${fmt(pot, 1)} BB`, betSizes(live, stack), facing, '对手已下注，应使用「加注」'));
+  const betTitle = preflop && !facing ? '加注（大盲期权）' : '下注';
+  out.push(sizeActionCard('BET', betTitle, `主动投入 · 底池 ${fmt(pot, 1)} BB`, betSizes(live, stack), facing, '对手已下注，应使用「加注」'));
   const minTo = Math.max(0, Number(live.highest) || 0) + Math.max(1, Number(live.lastRaise) || 1);
   out.push(sizeActionCard('RAISE_TO', '加注', minTo > 0 ? `本街投入提到 ${fmt(minTo, 1)} BB 起` : '把本街投入提高到指定额', raiseSizes(live, stack), !facing, '无人下注，应使用「下注」'));
   out.push(simpleActionCard('ALLIN', `全下 ${fmt(stack, 1)}`, `投入全部后手 ${fmt(stack, 1)} BB`, stack <= 0.5, '后手不足'));
-  return `<div class="ac-grid">${out.join('')}</div>`;
+  return `<div class="ac-grid">${out.join('')}</div>
+    ${notes.map(n => `<div class="ac-note">${esc(n)}</div>`).join('')}
+    ${ui.act.force ? `<div class="notice" style="margin-top:8px">手动补录模式：当前行动者 <b>${esc(nextActorFor(h, street) || '—')}</b>。
+      <button class="btn sm" data-act="cancelForce">恢复自动顺位</button></div>` : ''}`;
 }
 
 /* ---------- 行动时间线 ---------- */
@@ -558,10 +561,10 @@ function timelineHtml(h, idxs, di) {
       <div class="tl-row">${items.map(({ a, i }) => {
         const isDecision = idxs.includes(i);
         const side = actorKey(h, a.actor) === 'HERO' ? 'hero' : actorKey(h, a.actor) === 'VILLAIN' ? 'villain' : 'other';
-        return `<button class="tl-pill ${side} ${a.type === 'FOLD' ? 'fold' : ''} ${i === di ? 'on' : ''} ${ui.act.flash && ui.act.flash.idx === i ? 'flash' : ''}" data-act="editAction" data-v="${i}" title="点击编辑 / 删除 / 设为决策点">
+        return `<button class="tl-pill ${side} ${a.type === 'FOLD' ? 'fold' : ''} ${a.auto ? 'auto' : ''} ${i === di ? 'on' : ''} ${ui.act.flash && ui.act.flash.idx === i ? 'flash' : ''}" data-act="editAction" data-v="${i}" title="点击编辑 / 删除 / 设为决策点">
           <span class="no">#${i + 1}</span><span class="who">${esc(a.actor)}</span><span class="what">${ACTION_LABEL[a.type] || a.type}</span>
           ${a.amountBB != null ? `<b>${fmt(a.amountBB, 1)}</b>` : ''}
-          ${isDecision ? '<span class="flag">决策点</span>' : ''}
+          ${a.auto ? '<span class="flag auto">默认</span>' : ''}${isDecision ? '<span class="flag">决策点</span>' : ''}
         </button>`;
       }).join('')}</div></div>`;
   }).join('');
@@ -584,12 +587,18 @@ function wizardStep2(h, di, v, rd) {
   const street = actStreet(h);
   const si = STREETS.indexOf(street);
   const acts = h.actions || [];
-  const actor = nextActorFor(h, street);
-  const live = liveFor(h, street).live;
+  const { live, f: flow } = liveFor(h, street);
+  const closed = flow.closed && !ui.act.force;
+  const actor = closed ? null : (nextActorFor(h, street) || flow.first);
   const toCall = Math.max(0, Number(live.toCall) || 0);
   const actorSideName = actorKey(h, actor) === 'HERO' ? 'Hero' : actorKey(h, actor) === 'VILLAIN' ? '对手' : '其他位置';
   const boardNeed = stageBoardCount(street);
   const boardNow = (h.board || []).filter(c => c != null).length;
+  const heroPos = String(h.positions.hero || '').toUpperCase();
+  const villainPos = String(h.positions.villain || '').toUpperCase();
+  const usedAliases = [...new Set(acts.map(a => String(a.actor).toUpperCase()).filter(x => x === 'HERO' || x === 'VILLAIN'))];
+  const actorOptions = [...new Set([heroPos, villainPos, ...usedAliases])];
+  const otherPos = positionsFor(h.tableSize).filter(p => p !== heroPos && p !== villainPos);
   const stageNav = STREETS.map((st, i) => {
     const need = stageBoardCount(st);
     const done = i > 0 && boardNow >= need;
@@ -611,31 +620,38 @@ function wizardStep2(h, di, v, rd) {
     ${boardCard}
     <div class="stage-actions">
       ${nextSt ? `<button class="btn primary" data-act="advanceStage">下一步：${STREET_NAME[nextSt]} →</button>` : '<span class="tiny muted">已到河牌，可直接解算</span>'}
+      ${si > 0 && boardNow < boardNeed ? `<button class="btn sm" data-act="solveStreet" data-v="${STREETS[si - 1]}" title="切换回上一街并解算该街的 Hero 决策">先解算${STREET_NAME[STREETS[si - 1]]}</button>` : ''}
       <button class="btn sm" data-act="toggleParams">${wizard.paramsOpen ? '收起求解参数' : '求解参数（范围 / 尺度 / 模式）'}</button>
       <span class="tiny muted">当前阶段：${STREET_NAME[street]}</span>
     </div>
-    <div class="turn-bar">
-      <div class="turn-who"><span class="turn-label">下一位行动</span><b class="side-${actorKey(h, actor) === 'HERO' ? 'hero' : 'villain'}">${esc(actor)}</b><span class="tiny muted">${actorSideName}</span></div>
+    <div class="turn-bar ${closed ? 'is-closed' : ''}">
+      <div class="turn-who">
+        ${closed
+          ? `<span class="turn-label">本街状态</span><b class="side-done">已结束</b><span class="tiny muted">${esc(flow.closedReason)}</span>`
+          : `<span class="turn-label">轮到行动</span><b class="side-${actorKey(h, actor) === 'HERO' ? 'hero' : 'villain'}">${esc(actor)}</b><span class="tiny muted">${actorSideName}</span>`}
+      </div>
       <div class="turn-nums">
         <div><span>待跟注</span><b>${fmt(toCall, 1)}</b></div>
         <div><span>最小加注至</span><b>${fmt((Number(live.highest) || 0) + Math.max(1, Number(live.lastRaise) || 1), 1)}</b></div>
         <div><span>后手</span><b>${fmt(h.stackBB, 1)}</b></div>
       </div>
-      <label class="field turn-pick"><span>换人</span><select data-act="setActor">${[...positionsFor(h.tableSize), 'HERO', 'VILLAIN'].map(x => `<option value="${x}" ${x === actor ? 'selected' : ''}>${x}</option>`).join('')}</select></label>
+      <label class="field turn-pick"><span>换人</span><select data-act="setActor">${actorOptions.map(x => `<option value="${x}" ${x === actor ? 'selected' : ''}>${x}</option>`).join('')}</select></label>
+      ${ui.act.actor ? '<button class="btn sm" data-act="resetActor">自动顺位</button>' : ''}
     </div>
     ${tableHtml(h, street, actor, live)}
-    ${actionCardsHtml(h, live, toCall)}
-    <details class="adv-amt"><summary>自定义金额（可选）</summary>
+    ${actionCardsHtml(h, live, toCall, street, flow)}
+    ${closed ? '' : `<details class="adv-amt"><summary>自定义金额（可选）</summary>
       <div class="row" style="margin-top:6px"><input type="number" id="naAmount" step="0.1" min="0" placeholder="输入 BB 数，然后点上方「自定义」">
       <span class="tiny muted">用于「下注 / 加注」的「自定义」按钮；留空则采用卡片上的建议值。</span></div>
-    </details>
+    </details>`}
   </div>
   <div class="card"><div class="card-title"><h2>动作时间线</h2><span class="tiny muted">点任意一条可编辑 / 删除 / 设为决策点</span></div>
     ${timelineHtml(h, idxs, di)}
+    <div class="auto-fold-note">其余 ${otherPos.length} 个位置（${esc(otherPos.join(' / '))}）已按第 1 步的位置设定<b>默认翻前弃牌</b>，无需逐一录入；仅 ${esc(heroPos)}（Hero）与 ${esc(villainPos)}（对手）参与行动。</div>
     <div class="row" style="margin-top:10px">
       <button class="btn sm" data-act="undoAction" ${acts.length ? '' : 'disabled'}>↶ 撤销末条</button>
       <button class="btn sm" data-act="clearActions" ${acts.length ? '' : 'disabled'}>清空</button>
-      <button class="btn sm" data-act="foldToHero" title="一次性生成翻前 Hero 之前所有位置的弃牌">翻前弃牌到 Hero</button>
+      <button class="btn sm" data-act="foldToHero" title="把其它位置的翻前弃牌显式写入行动流（用于导出 HH）">补录其它位置弃牌（可选）</button>
       <button class="btn sm" data-act="toggleBulk">${ui.act.bulk ? '收起批量录入' : '批量粘贴录入'}</button>
       <button class="btn sm" data-act="loadExampleActions">填充标准示例</button>
     </div>
@@ -1017,6 +1033,8 @@ function handleBind(target) {
   if (!wizard) return;
   const h = wizard.hand;
   const path = target.dataset.bind;
+  // 第 1 步改了座位设定后，清掉上一套手动行动者 / 补录状态
+  if (String(path).startsWith('positions.') || path === 'tableSize') { ui.act.actor = null; ui.act.force = false; }
   let v = target.type === 'checkbox' ? target.checked : target.value;
   if (target.type === 'number' || /^(stakes|stackBB|tableSize|intensity|potOverrideBB|stackOverrideBB|customSizes|deadText)$/.test(path)) {
     if (path === 'customSizes') {
@@ -1064,7 +1082,11 @@ document.addEventListener('change', e => {
     }
     return;
   }
-  if (t.dataset.act === 'setActor') { ui.act.actor = t.value; render(); return; }
+  if (t.dataset.act === 'setActor') {
+    ui.act.actor = t.value;
+    if (wizard && actionFlow(wizard.hand, actStreet(wizard.hand)).closed) ui.act.force = true;
+    render(); return;
+  }
   if (t.dataset.bind) { handleBind(t); if (t.dataset.refresh) render(); return; }
   if (t.dataset.act === 'rangePreset' || t.dataset.rangePreset) {
     const side = t.dataset.rangePreset || t.dataset.side; wizard.hand.rangePresets[side] = t.value; wizard.hand.ranges[side] = presetMatrix(t.value);
@@ -1153,13 +1175,16 @@ function handleAct(act, ds, ev) {
     case 'clearCards': { const h = wizard.hand; if (ds.kind === 'hero') h.heroCards = []; else if (ds.kind === 'villain') h.villainCards = []; else h.board = []; refresh(); break; }
     case 'setStreet':
     case 'nextStreet':
-      wizard.stage = v; ui.act.street = null; ui.act.actor = null; wizard.decisionIndex = null;
+      wizard.stage = v; ui.act.street = null; ui.act.actor = null; ui.act.force = false; wizard.decisionIndex = null;
       saveWizard(); render(); break;
+    case 'solveStreet':
+      wizard.stage = v; ui.act.street = null; ui.act.actor = null; ui.act.force = false;
+      saveWizard(); render(); beginSolve(); break;
     case 'advanceStage': {
       const si = STREETS.indexOf(wizard.stage);
       if (si >= 3) { toast('已到河牌，可直接解算'); break; }
       wizard.stage = STREETS[si + 1];
-      ui.act.street = null; ui.act.actor = null; wizard.decisionIndex = null;
+      ui.act.street = null; ui.act.actor = null; ui.act.force = false; wizard.decisionIndex = null;
       const need = stageBoardCount(wizard.stage);
       const have = (wizard.hand.board || []).filter(c => c != null).length;
       saveWizard(); render();
@@ -1167,8 +1192,20 @@ function handleAct(act, ds, ev) {
       break;
     }
     case 'toggleParams': wizard.paramsOpen = !wizard.paramsOpen; render(); break;
+    case 'setActorSeat': {
+      const h = wizard.hand, street = actStreet(h), flow = actionFlow(h, street);
+      ui.act.actor = v;
+      if (flow.closed) ui.act.force = true;
+      render(); toast(`已指定 ${v} 行动${flow.closed ? '（手动补录模式）' : ''}`); break;
+    }
+    case 'forceAct': ui.act.force = true; render(); toast('手动补录已开启，可继续在本街录入动作'); break;
+    case 'cancelForce': ui.act.force = false; ui.act.actor = null; render(); break;
+    case 'resetActor': ui.act.actor = null; render(); toast('已恢复自动顺位'); break;
     case 'quickAction': {
-      const h = wizard.hand, street = actStreet(h), actor = nextActorFor(h, street);
+      const h = wizard.hand, street = actStreet(h), si = STREETS.indexOf(street);
+      const flow = actionFlow(h, street);
+      if (flow.closed && !ui.act.force) { toast('本街行动已结束：请进入下一街，或点「仍要在本街补录」'); break; }
+      const actor = nextActorFor(h, street) || flow.first;
       const { live } = liveFor(h, street);
       const sug = suggestedAmounts(h, live);
       let amountBB = sug[v];
@@ -1183,19 +1220,27 @@ function handleAct(act, ds, ev) {
       if (v === 'FOLD' || v === 'CHECK') amountBB = null;
       if (['CALL', 'BET', 'RAISE_TO'].includes(v) && !(amountBB > 0)) { toast('金额需大于 0'); break; }
       // 按街序插入，允许回到前面的街补录而不破坏行动流顺序
-      const si = STREETS.indexOf(street);
       let insertAt = h.actions.length;
       for (let k = h.actions.length - 1; k >= 0; k--) {
         if (STREETS.indexOf(String(h.actions[k].street).toUpperCase()) <= si) { insertAt = k + 1; break; }
         insertAt = k;
       }
       h.actions.splice(insertAt, 0, { street, actor, type: v, amountBB });
-      ui.act.actor = null; wizard.decisionIndex = null; wizard.bulkInfo = null;
+      ui.act.actor = null; ui.act.force = false; wizard.decisionIndex = null; wizard.bulkInfo = null;
       const label = `${actor} ${ACTION_LABEL[v]}${amountBB != null ? ' ' + fmt(amountBB, 1) + ' BB' : ''}`;
       ui.act.flash = { idx: insertAt, at: Date.now() };
-      saveWizard(); render();
-      const next = nextActorFor(h, street);
-      toast(`已录入 #${insertAt + 1} · ${label} · 轮到 ${next}`);
+      const after = actionFlow(h, street);
+      let msg = `已录入 #${insertAt + 1} · ${label}`;
+      if (after.closed) {
+        if (after.handOver) msg += ' · 本手结束，可直接解算';
+        else if (si < 3) {
+          wizard.stage = STREETS[si + 1];
+          const need = stageBoardCount(wizard.stage);
+          const have = (h.board || []).filter(c => c != null).length;
+          msg += ` · 本街结束 → 自动进入${STREET_NAME[wizard.stage]}${have < need ? `，请选择 ${need - have} 张公共牌` : ''}`;
+        } else msg += ' · 河牌行动结束，可直接解算';
+      } else msg += ` · 轮到 ${after.actor}`;
+      saveWizard(); render(); toast(msg);
       break;
     }
     case 'beginSolve': beginSolve(); break;
@@ -1218,23 +1263,25 @@ function handleAct(act, ds, ev) {
       closeModal(); wizard.decisionIndex = null; refresh(); toast(`已更新 #${i + 1}`);
       break;
     }
-    case 'undoAction': wizard.hand.actions.pop(); wizard.decisionIndex = null; refresh(); break;
+    case 'undoAction': wizard.hand.actions.pop(); wizard.decisionIndex = null; ui.act.force = false; ui.act.actor = null; refresh(); break;
     case 'clearActions': {
       confirmDialog('清空行动流', '将删除已录入的全部行动，是否继续？', () => {
         wizard.hand.actions = []; wizard.decisionIndex = null;
-        ui.act.street = null; ui.act.actor = null; refresh();
+        ui.act.street = null; ui.act.actor = null; ui.act.force = false; refresh();
       }, '清空');
       break;
     }
     case 'foldToHero': {
-      const h = wizard.hand, pos = positionsFor(h.tableSize);
-      const hero = String(h.positions.hero).toUpperCase();
-      const hi = pos.findIndex(x => x.toUpperCase() === hero);
-      if (hi <= 0) { toast('Hero 位置已是首位或不在座位表中，无需生成弃牌'); break; }
-      const rest = (h.actions || []).filter(a => String(a.street).toUpperCase() !== 'PREFLOP');
-      h.actions = [...pos.slice(0, hi).map(actor => ({ street: 'PREFLOP', actor, type: 'FOLD', amountBB: null })), ...rest];
-      wizard.decisionIndex = null; wizard.stage = 'PREFLOP'; ui.act.street = null; ui.act.actor = hero;
-      refresh(); toast(`已生成 ${hi} 条翻前弃牌，下一位 ${hero}`); break;
+      // 其它位置本来就是隐式默认弃牌；此按钮仅把它们显式写入行动流（便于导出 HH）
+      const h = wizard.hand;
+      const hero = String(h.positions.hero).toUpperCase(), villain = String(h.positions.villain).toUpperCase();
+      const others = positionsFor(h.tableSize).filter(p => p !== hero && p !== villain);
+      const already = new Set((h.actions || []).filter(a => String(a.street).toUpperCase() === 'PREFLOP').map(a => String(a.actor).toUpperCase()));
+      const adds = others.filter(p => !already.has(p)).map(actor => ({ street: 'PREFLOP', actor, type: 'FOLD', amountBB: null, auto: true }));
+      if (!adds.length) { toast('其它位置的翻前弃牌已存在，无需补录'); break; }
+      h.actions = [...adds, ...(h.actions || [])];
+      wizard.decisionIndex = null; ui.act.actor = null; ui.act.force = false;
+      refresh(); toast(`已补录 ${adds.length} 条其它位置弃牌（仅影响导出，不改变行动顺位）`); break;
     }
     case 'toggleBulk': ui.act.bulk = !ui.act.bulk; render(); break;
     case 'bulkLoadExample': wizard.bulkText = BULK_EXAMPLE; wizard.bulkInfo = null; render(); break;

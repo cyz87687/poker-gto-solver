@@ -151,22 +151,38 @@ canvas{max-width:100%;display:block}
 .felt-board{display:flex;gap:4px;justify-content:center;margin:5px 0 2px;flex-wrap:wrap}
 .felt-board .mini-card{min-width:30px;height:32px;font-size:12px;background:#fff;border-color:#dfe4ea}
 .felt-street{font-size:10.5px;letter-spacing:1px;opacity:.75}
-.seat{position:absolute;transform:translate(-50%,-50%);background:var(--surface);border:1px solid var(--line);border-radius:9px;padding:4px 7px;text-align:center;min-width:62px;box-shadow:0 1px 4px rgba(0,0,0,.12);transition:box-shadow .15s,transform .15s}
+.seat{position:absolute;transform:translate(-50%,-50%);background:var(--surface);border:1px solid var(--line);border-radius:9px;padding:4px 7px;text-align:center;min-width:62px;box-shadow:0 1px 4px rgba(0,0,0,.12);transition:box-shadow .15s,transform .15s,opacity .15s}
 .seat .seat-nm{font-size:11.5px;font-weight:700;line-height:1.2}
 .seat .seat-tag{font-size:9.5px;color:var(--text-3);line-height:1.3;white-space:nowrap}
 .seat .seat-bet{position:absolute;left:50%;bottom:-10px;transform:translateX(-50%);background:#1c2330;color:#fff;font-size:10px;border-radius:9px;padding:0 6px;white-space:nowrap}
-.seat .seat-act{position:absolute;left:50%;top:-12px;transform:translateX(-50%);background:var(--accent);color:#fff;font-size:9px;border-radius:8px;padding:0 5px;white-space:nowrap;z-index:3}
-.seat.hero{border-color:var(--accent);background:var(--accent-soft)}
+.seat .seat-act{position:absolute;left:50%;top:-14px;transform:translateX(-50%);background:var(--accent);color:#fff;font-size:9px;border-radius:8px;padding:1px 6px;white-space:nowrap;z-index:3;box-shadow:0 1px 5px rgba(59,91,219,.5)}
+/* 身份只用小字标识；未轮到行动的座位保持中性，不亮起 */
 .seat.hero .seat-tag{color:var(--accent);font-weight:600}
-.seat.villain{border-color:#b9c0cc}
-.seat.folded,.seat.out{opacity:.4}
-.seat.active{box-shadow:0 0 0 2px var(--accent),0 2px 8px rgba(59,91,219,.35);z-index:2;transform:translate(-50%,-50%) scale(1.06)}
-.table-legend{display:flex;gap:12px;justify-content:center;font-size:10.5px;color:var(--text-3);margin-top:8px;flex-wrap:wrap}
+.seat.villain .seat-tag{color:#6b7484;font-weight:600}
+.seat.live{cursor:pointer}
+.seat.live:hover{border-color:var(--accent)}
+.seat.other{opacity:.42}
+.seat.folded{opacity:.3}
+/* 唯一亮起：当前行动者 */
+.seat.active{opacity:1;border-color:var(--accent);background:var(--accent-soft);box-shadow:0 0 0 2px var(--accent),0 0 0 6px rgba(59,91,219,.14),0 3px 12px rgba(59,91,219,.4);z-index:2;transform:translate(-50%,-50%) scale(1.1)}
+.seat.active .seat-nm{color:var(--accent)}
+.table-legend{display:flex;gap:12px;justify-content:center;align-items:center;font-size:10.5px;color:var(--text-3);margin-top:8px;flex-wrap:wrap}
 .table-legend .dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:4px;vertical-align:middle;background:#cfd5df}
 .table-legend .dot.hero{background:var(--accent)}
 .table-legend .dot.villain{background:#8a93a3}
 .table-legend .dot.folded{background:#d9dde4}
 .table-legend .dot.active{background:var(--accent);box-shadow:0 0 0 2px var(--accent-soft)}
+.turn-bar.is-closed{background:#eef8f2;border:1px solid #c6e8d5}
+.turn-who b.side-done{color:#0f7a4d}
+.street-done{margin-top:10px;border:1px solid #c6e8d5;background:#f3fbf6;border-radius:10px;padding:12px}
+.street-done.over{border-color:#e4d8c0;background:#fbf8f1}
+.sd-hd{display:flex;align-items:flex-start;gap:10px}
+.sd-ic{width:24px;height:24px;flex:0 0 24px;border-radius:50%;background:#0f7a4d;color:#fff;display:flex;align-items:center;justify-content:center;font-size:13px;font-weight:700}
+.street-done.over .sd-ic{background:#a07a2a}
+.ac-note{margin-top:8px;font-size:11.5px;color:var(--text-2);background:var(--surface-2);border-left:3px solid var(--accent);border-radius:6px;padding:7px 9px}
+.auto-fold-note{margin-top:10px;font-size:11.5px;color:var(--text-2);background:var(--surface-2);border-radius:8px;padding:8px 10px;line-height:1.5}
+.tl-pill.auto{opacity:.62;border-style:dashed}
+.tl-pill .flag.auto{background:#8a93a3}
 
 /* 行动卡片 */
 .ac-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}
