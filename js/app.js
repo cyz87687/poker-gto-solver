@@ -307,9 +307,9 @@ function renderParseInfo(info) {
   const h = info.hand;
   const v = validateHand(h);
   return `<div class="notice info" style="margin-top:12px"><b>解析成功</b>：${esc(h.positions.hero)} ${h.heroCards.map(cardStr).join('')} · 公共牌 ${h.board.map(cardStr).join(' ')} · ${h.actions.length} 条行动 · 校验${v.ok ? '通过' : '存在 ' + v.errors.length + ' 处错误'}</div>
-  ${v.errors.length ? `<div class="notice danger" style="margin-top:8px">${v.errors.map(e => esc(e.path + '：' + e.msg)).join('<br>')}</div>` : ''}
+  ${v.errors.length ? `<div class="notice danger" style="margin-top:8px"><b>该行动线不合逻辑，已拦截：</b><br>${v.errors.map(e => esc(e.path + '：' + e.msg)).join('<br>')}</div>` : ''}
   ${v.warnings.length ? `<div class="notice" style="margin-top:8px">${v.warnings.map(esc).join('<br>')}</div>` : ''}
-  <div class="row" style="margin-top:10px"><button class="btn primary" data-act="useParsed" ${v.ok ? '' : 'disabled'}>使用此牌谱继续配置</button></div>`;
+  <div class="row" style="margin-top:10px"><button class="btn primary" data-act="useParsed" ${v.ok ? '' : 'disabled'}>使用此牌谱继续配置</button>${v.ok ? '' : '<button class="btn" data-act="useParsedForce">仍要载入并修正</button>'}</div>`;
 }
 function renderWizard(w) {
   const h = w.hand;
@@ -725,7 +725,16 @@ function timelineHtml(h, idxs, di) {
   const acts = h.actions || [];
   const pend = pendingHeroDecision(h);
   if (!acts.length && !pend) return '<div class="empty">还没有录入行动 · 点击上方卡片即录入一条</div>';
-  return STREETS.map(st => {
+  // 违规行动标注：状态机检出的不合逻辑行动（下注未被回应 / 收口后又行动 / 已弃牌又行动）
+  const badMap = new Map();
+  for (const e of validateHand(h).errors || []) {
+    const m = String(e.path || '').match(/^actions\[(\d+)\]$/);
+    if (m) badMap.set(Number(m[1]), e.msg);
+  }
+  const banner = badMap.size
+    ? `<div class="notice danger">⚠ 行动流有 <b>${badMap.size}</b> 处不合逻辑（见红色标注）：${esc([...badMap.values()][0])}${badMap.size > 1 ? ' 等' : ''}。点对应行动修正或删除后再解算。</div>`
+    : '';
+  return banner + STREETS.map(st => {
     const items = acts.map((a, i) => ({ a, i })).filter(x => String(x.a.street).toUpperCase() === st);
     const pendHere = pend && pend.street === st;
     if (!items.length && !pendHere) return '';
@@ -735,11 +744,12 @@ function timelineHtml(h, idxs, di) {
     return `<div class="tl-street"><div class="tl-hd"><b>${STREET_NAME[st]}</b><span class="tiny muted">${items.length} 条${pendHere ? ' · 1 待决策' : ''}</span></div>
       <div class="tl-row">${items.map(({ a, i }) => {
         const isDecision = idxs.includes(i);
+        const bad = badMap.has(i);
         const side = actorKey(h, a.actor) === 'HERO' ? 'hero' : actorKey(h, a.actor) === 'VILLAIN' ? 'villain' : 'other';
-        return `<button class="tl-pill ${side} ${a.type === 'FOLD' ? 'fold' : ''} ${a.auto ? 'auto' : ''} ${i === di ? 'on' : ''} ${ui.act.flash && ui.act.flash.idx === i ? 'flash' : ''}" data-act="editAction" data-v="${i}" title="点击编辑 / 删除 / 设为决策点">
+        return `<button class="tl-pill ${side} ${a.type === 'FOLD' ? 'fold' : ''} ${a.auto ? 'auto' : ''} ${bad ? 'bad' : ''} ${i === di ? 'on' : ''} ${ui.act.flash && ui.act.flash.idx === i ? 'flash' : ''}" data-act="editAction" data-v="${i}" title="${bad ? esc(badMap.get(i)) : '点击编辑 / 删除 / 设为决策点'}">
           <span class="no">#${i + 1}</span><span class="who">${esc(a.actor)}</span><span class="what">${ACTION_LABEL[a.type] || a.type}</span>
           ${a.amountBB != null ? `<b>${fmt(a.amountBB, 1)}</b>` : ''}
-          ${a.auto ? '<span class="flag auto">默认</span>' : ''}${isDecision ? '<span class="flag">决策点</span>' : ''}
+          ${a.auto ? '<span class="flag auto">默认</span>' : ''}${isDecision ? '<span class="flag">决策点</span>' : ''}${bad ? '<span class="flag bad">⚠ 不合逻辑</span>' : ''}
         </button>`;
       }).join('')}${pendHtml}</div></div>`;
   }).join('');
@@ -747,7 +757,7 @@ function timelineHtml(h, idxs, di) {
 
 /* ---------- 就绪度 ---------- */
 function readinessStrip(rd) {
-  const keys = ['heroCards', 'board', 'headsUp', 'actions'];
+  const keys = ['heroCards', 'board', 'headsUp', 'actions', 'positions'];
   const items = rd.items.filter(i => keys.includes(i.key));
   return `<div class="rd-strip">${items.map(i => `<button class="rd ${i.ok ? 'ok' : 'ng'}" data-act="showReadiness"><span>${i.ok ? '✓' : '✕'}</span>${esc(i.label)}</button>`).join('')}
     ${rd.ready ? '' : '<button class="rd ng more" data-act="showReadiness">查看还差什么 →</button>'}</div>`;
@@ -1202,6 +1212,18 @@ function setPath(obj, path, value) {
   for (let i = 0; i < parts.length - 1; i++) { if (o[parts[i]] == null) o[parts[i]] = {}; o = o[parts[i]]; }
   o[parts[parts.length - 1]] = value;
 }
+/** Hero 与对手位置不能相同：冲突时自动改派对手，否则对手的行动会被判成第三方、下注后不出跟注选项 */
+function syncDistinctPositions(h) {
+  const pos = positionsFor(h.tableSize).map(p => String(p).toUpperCase());
+  const heroU = String(h.positions.hero).toUpperCase();
+  if (String(h.positions.villain).toUpperCase() === heroU) {
+    const alt = heroU !== 'BTN' ? 'BTN' : 'BB';
+    h.positions.villain = pos.includes(alt) ? alt : (pos.find(p => p !== heroU) || 'BB');
+    toast(`对手位置不能与 Hero 相同，已自动改为 ${h.positions.villain}`);
+    return true;
+  }
+  return false;
+}
 function handleBind(target) {
   if (!wizard) return;
   const h = wizard.hand;
@@ -1218,9 +1240,10 @@ function handleBind(target) {
     if (path === 'deadText') { h.deadCards = parseCardList(String(v)); return; }
     if (path === 'potOverrideBB' || path === 'stackOverrideBB') { h[path] = v === '' ? null : Number(v); return; }
     v = Number(v);
-    if (path === 'tableSize') { h.tableSize = v === 9 ? 9 : 6; const pos = positionsFor(h.tableSize); if (!pos.includes(h.positions.hero)) h.positions.hero = 'BTN'; if (!pos.includes(h.positions.villain)) h.positions.villain = 'BB'; return; }
+    if (path === 'tableSize') { h.tableSize = v === 9 ? 9 : 6; const pos = positionsFor(h.tableSize); if (!pos.includes(h.positions.hero)) h.positions.hero = 'BTN'; if (!pos.includes(h.positions.villain)) h.positions.villain = 'BB'; syncDistinctPositions(h); return; }
   }
   setPath(h, path, v);
+  if (String(path).startsWith('positions.')) syncDistinctPositions(h);
   saveDraft(h);
 }
 function saveWizard() { if (wizard) saveDraft(wizard.hand); }
@@ -1314,12 +1337,15 @@ function handleAct(act, ds, ev) {
       render(); break;
     }
     case 'pasteToWizard': ui.wizTab = 'wizard'; wizard.wizTab = 'wizard'; render(); break;
-    case 'useParsed': {
+    case 'useParsed':
+    case 'useParsedForce': {
       const h = wizard.parseInfo.hand;
       wizard.hand = h; wizard.step = 2; wizard.decisionIndex = null;
       wizard.stage = stageFromBoard((h.board || []).length); wizard.paramsOpen = false;
       ui.wizTab = 'wizard'; wizard.wizTab = 'wizard';
-      saveWizard(); render(); toast(`已载入牌谱 · 当前阶段：${STREET_NAME[wizard.stage]}`); break;
+      saveWizard(); render();
+      toast(v === 'useParsedForce' ? '已载入牌谱 · 请按红色标注修正不合逻辑的行动' : `已载入牌谱 · 当前阶段：${STREET_NAME[wizard.stage]}`);
+      break;
     }
     case 'pickCard': openCardPicker(ds.kind, Number(ds.idx)); break;
     case 'pickCardCell': {
@@ -1339,19 +1365,25 @@ function handleAct(act, ds, ev) {
       else if (p.kind === 'board') h.board[p.idx] = c;
       else h.deadCards.push(c);
       closeModal();
-      // 公共牌刚选齐当前街最后一张 → 自动进入下一街（仅 UI 阶段推进，不改动任何已录入数据）
-      let advanced = false;
+      // 公共牌刚选齐当前街最后一张 → 仅当本街行动已收口时自动进入下一街（行动未完先留在本街，避免出现未回应就换街的行动线）
+      let advanced = false, stayNote = '';
       if (p.kind === 'board' && need0 > 0 && beforeFilled === need0 - 1) {
         const afterFilled = (h.board || []).filter(x => x != null).slice(0, need0).length;
         const si0 = STREETS.indexOf(wizard.stage);
         if (afterFilled >= need0 && si0 >= 0 && si0 < 3) {
-          wizard.stage = STREETS[si0 + 1];
-          ui.act.actor = null; ui.act.force = false; wizard.decisionIndex = null;
-          advanced = true;
+          const fl = actionFlow(h, street0);
+          if (fl.closed || fl.handOver) {
+            wizard.stage = STREETS[si0 + 1];
+            ui.act.actor = null; ui.act.force = false; wizard.decisionIndex = null;
+            advanced = true;
+          } else {
+            stayNote = `公共牌已选齐 · 请录完${STREET_NAME[street0]}行动（下注需被回应），收口后自动进入下一街`;
+          }
         }
       }
       refresh();
       if (advanced) toast(`${STREET_NAME[street0]}公共牌已选齐 · 自动进入${STREET_NAME[wizard.stage]}`);
+      else if (stayNote) toast(stayNote);
       break;
     }
     case 'clearCard': {

@@ -390,5 +390,89 @@ Flop: [Kd6h9s]  BB check, BTN bet 9.0`;
   ok('序列化往返后位置仍正确', back.hand.positions.hero === 'BB' && back.hand.positions.villain === 'BTN', JSON.stringify(back.hand.positions));
 }
 
+console.log('\n[11] 行动线合法性与跟注选项（V1.7 回归）');
+/* 行动线合法性与跟注选项（V1.7 回归） */
+{
+  const userHH = `# PokerGTO HH v1
+Game: NLHE
+Stakes: SB=1 BB=2
+Table: 6max
+Hero: BB [3cKc]
+Stacks: Hero=100 Villain=100 (BB)
+Preflop:  BTN raise 4.0, BB call 4.0
+Flop: [Kd5h8s]  BB bet 6.4
+Turn: [Kd5h8sTs]  BB check, BTN bet 10.7, BB call 10.7
+River: [Kd5h8sTs5s]  BB check, BTN bet 37.3, BB call 37.3, BB check`;
+  const pu = parseHH(userHH);
+  const vu = validateHand(pu.hand);
+  ok('不合牌谱被判非法（ok=false）', vu.ok === false, `ok=${vu.ok}`);
+  ok('翻牌下注未被回应就进转牌 → 报错', vu.errors.some(e => e.path === 'actions[3]' && /未被回应/.test(e.msg)),
+    JSON.stringify(vu.errors.map(e => e.path)));
+  ok('河牌收口后又录过牌 → 报错', vu.errors.some(e => e.path === 'actions[9]' && /下注轮已结束/.test(e.msg)),
+    JSON.stringify(vu.errors.map(e => e.path)));
+  ok('违规行动流阻断解算（就绪度 actions 不通过）', solveReadiness(pu.hand, 'RIVER').items.some(i => i.key === 'actions' && !i.ok));
+
+  // 位置冲突（Hero=BB、对手也=BB）：下注后必须仍轮到对手、待跟注 > 0（跟注选项存在）
+  const clash = defaultHand();
+  clash.positions = { hero: 'BB', villain: 'BB' };
+  clash.heroCards = [23, 11]; clash.board = [24, 29, 45];
+  clash.actions = [
+    { street: 'PREFLOP', actor: 'BTN', type: 'RAISE_TO', amountBB: 4 },
+    { street: 'PREFLOP', actor: 'BB', type: 'CALL', amountBB: 4 },
+    { street: 'FLOP', actor: 'BB', type: 'BET', amountBB: 6.4 }
+  ];
+  const fc = actionFlow(clash, 'FLOP');
+  ok('位置冲突时下注后不误判收口（跟注选项仍在）', fc.closed === false && fc.actor === 'BTN' && fc.toCall > 0, JSON.stringify({ actor: fc.actor, closed: fc.closed, toCall: fc.toCall }));
+  const vc = validateHand(clash);
+  ok('位置冲突被报错并阻断解算', vc.errors.some(e => e.path === 'positions') && vc.solveAllowed === false);
+  ok('就绪度包含「位置不同」检查项', solveReadiness(clash, 'FLOP').items.some(i => i.key === 'positions' && !i.ok));
+
+  // 挂起状态（行动以下注收尾、轮到对手）是合法中间态，不报错
+  const pend = defaultHand();
+  pend.positions = { hero: 'BB', villain: 'BTN' };
+  pend.heroCards = [23, 11]; pend.board = [24, 29, 45];
+  pend.actions = [
+    { street: 'PREFLOP', actor: 'BTN', type: 'RAISE_TO', amountBB: 4 },
+    { street: 'PREFLOP', actor: 'BB', type: 'CALL', amountBB: 4 },
+    { street: 'FLOP', actor: 'BB', type: 'BET', amountBB: 6.4 }
+  ];
+  const vp = validateHand(pend);
+  ok('挂起状态（下注待回应）不报错', vp.ok === true, JSON.stringify(vp.errors));
+
+  // walk：翻前全弃牌到 BB，BB 过牌只有归档提示、不报错
+  const walk = defaultHand();
+  walk.positions = { hero: 'BB', villain: 'BTN' };
+  walk.heroCards = [23, 11];
+  walk.actions = ['UTG', 'MP', 'CO', 'BTN', 'SB'].map(p => ({ street: 'PREFLOP', actor: p, type: 'FOLD', amountBB: null }));
+  walk.actions.push({ street: 'PREFLOP', actor: 'BB', type: 'CHECK', amountBB: null });
+  const vw = validateHand(walk);
+  ok('walk 过牌不报错（仅提示）', vw.ok === true && vw.warnings.some(w => /walk/.test(w)), JSON.stringify(vw.errors));
+
+  // 双方全下 runout 后不再有行动，不误报
+  const ai = defaultHand();
+  ai.positions = { hero: 'BB', villain: 'BTN' };
+  ai.heroCards = [23, 11]; ai.board = [24, 29, 45, 47, 42];
+  ai.actions = [
+    { street: 'PREFLOP', actor: 'BTN', type: 'RAISE_TO', amountBB: 4 },
+    { street: 'PREFLOP', actor: 'BB', type: 'CALL', amountBB: 4 },
+    { street: 'FLOP', actor: 'BB', type: 'ALLIN', amountBB: 96 },
+    { street: 'FLOP', actor: 'BTN', type: 'CALL', amountBB: 96 }
+  ];
+  const va = validateHand(ai);
+  ok('全下被跟注收口不误报', va.ok === true, JSON.stringify(va.errors));
+
+  // 下注被跟注后本街收口；收口后再录一条 → 报错
+  const over = defaultHand();
+  over.positions = { hero: 'BB', villain: 'BTN' };
+  over.heroCards = [23, 11]; over.board = [24, 29, 45];
+  over.actions = [
+    { street: 'FLOP', actor: 'BB', type: 'BET', amountBB: 6 },
+    { street: 'FLOP', actor: 'BTN', type: 'CALL', amountBB: 6 },
+    { street: 'FLOP', actor: 'BB', type: 'CHECK', amountBB: null }
+  ];
+  const vo = validateHand(over);
+  ok('收口后多余的过牌被拦截', vo.ok === false && vo.errors.some(e => /下注轮已结束/.test(e.msg)));
+}
+
 console.log(`\n结果：${pass} 通过 / ${fail} 失败\n`);
 if (fail) process.exit(1);

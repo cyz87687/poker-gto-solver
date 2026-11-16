@@ -234,6 +234,10 @@ canvas{max-width:100%;display:block}
 .tl-pill.fold{opacity:.6}
 .tl-pill.on{border-color:var(--accent);box-shadow:0 0 0 2px var(--accent-soft)}
 .tl-pill .flag{font-size:9.5px;background:var(--accent);color:#fff;border-radius:6px;padding:0 5px}
+.tl-pill .flag.bad{background:#c0392b}
+.tl-pill.bad{border-color:#e0a9a2;background:#fdf1ef}
+.tl-pill.bad .flag.bad{animation:badPulse 1.6s ease-in-out infinite}
+@keyframes badPulse{0%,100%{opacity:1}50%{opacity:.55}}
 .tl-pill.flash{animation:flashPill 1s ease}
 .tl-pill.pending-hero{border-color:var(--accent);border-style:dashed;background:var(--accent-soft);box-shadow:0 0 0 1px var(--accent-soft)}
 .tl-pill.pending-hero.on{box-shadow:0 0 0 2px var(--accent)}

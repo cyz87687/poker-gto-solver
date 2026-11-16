@@ -245,25 +245,65 @@ export function validateHand(hand) {
   const stack = num(hand.stackBB) || 0;
   const sb = num(hand.stakes?.sb) || 1, bb = num(hand.stakes?.bb) || 2;
   const blindsBB = (sb / bb) + 1;
+  const heroPosU = String(hand.positions?.hero || '').toUpperCase();
+  const villainPosU = String(hand.positions?.villain || '').toUpperCase();
+  const posClash = !!heroPosU && heroPosU === villainPosU;
+  if (posClash) {
+    errors.push({ path: 'positions', msg: `Hero 与对手位置相同（都是 ${heroPosU}），行动流无法区分两家；请在第 1 步改成两个不同的位置` });
+  }
+  /** 行动者归一：HERO / VILLAIN 别名映射到实际座位名，避免同一人被当成两个投入账户 */
+  const normActor = raw => {
+    const u = String(raw || '').toUpperCase();
+    return u === 'HERO' ? heroPosU : u === 'VILLAIN' ? villainPosU : u;
+  };
 
   let pot = blindsBB;
-  const invest = new Map(); // actor -> 本街累计投入
+  const invest = new Map(); // 行动者(归一后) -> 本街累计投入
   let toCall = 1; // 大盲 1BB 视作待跟注额（翻前）
   let lastRaise = 1;
   let streetSeen = -1;
   let allInSides = new Set();
   let postActors = new Set();
+  // 行动线合法性（附录 A）：下注轮收口追踪 —— 换街时下注必须已被回应，收口后不得再录入行动
+  const participants = new Set([heroPosU, villainPosU].filter(Boolean));
+  for (const a of hand.actions || []) participants.add(normActor(a.actor)); // 预扫描：后续才行动的玩家也算本手参与者
+  const foldedSet = new Set();
+  const allInSet = new Set();
+  let actedSet = new Set();
+  let roundClosed = false;
+  let streetActionCount = 0;
   (hand.actions || []).forEach((a, idx) => {
     const path = `actions[${idx}]`;
     const st = String(a.street || '').toUpperCase();
     const si = STREETS.indexOf(st);
     if (si < 0) { errors.push({ path, msg: '未知街：' + st }); return; }
     if (si < streetSeen) { errors.push({ path, msg: '街序回退' }); return; }
-    if (si > streetSeen) { streetSeen = si; invest.clear(); toCall = si === 0 ? 1 : 0; lastRaise = 1; allInSides.clear(); }
-    if (si > 0) postActors.add(String(a.actor).toUpperCase());
+    if (si > streetSeen) {
+      if (streetSeen >= 0 && streetActionCount > 0 && !roundClosed) {
+        errors.push({
+          path,
+          msg: `「${STREETS[streetSeen]}」街行动未结束${toCall > 1e-6 ? `：下注 ${toCall.toFixed(1)} BB 未被回应（缺少跟注 / 加注 / 弃牌）` : '：仍有玩家未行动'}就进入了「${st}」`
+        });
+      }
+      streetSeen = si; invest.clear(); toCall = si === 0 ? 1 : 0; lastRaise = 1; allInSides.clear();
+      actedSet = new Set(); roundClosed = false; streetActionCount = 0;
+    }
+    const actor = normActor(a.actor);
+    if (si > 0) postActors.add(actor);
+    if (roundClosed) {
+      const liveP = [...participants].filter(p => !foldedSet.has(p));
+      const isWalk = liveP.length <= 1 && (a.type === 'CHECK' || a.type === 'FOLD');
+      if (isWalk) {
+        warnings.push(`第 ${idx + 1} 条：弃牌收尾后的${a.type === 'CHECK' ? '过牌' : '弃牌'}按 walk 归档`);
+        potTrace.push({ idx, street: st, pot: Math.round(pot * 10) / 10, toCall, highest: Math.round(Math.max(0, ...invest.values()) * 10) / 10, lastRaise });
+      } else {
+        errors.push({ path, msg: `下注轮已结束后又录入了行动（${a.actor} ${a.type}）；请删除或改写该行动` });
+      }
+      return;
+    }
     if (!known.has(String(a.actor || '').toUpperCase())) errors.push({ path, msg: `未知行动者「${a.actor}」` });
     if (!ACTION_TYPES.includes(a.type)) { errors.push({ path, msg: `未知动作「${a.type}」` }); return; }
-    const actor = String(a.actor).toUpperCase();
+    if (foldedSet.has(actor)) errors.push({ path, msg: `${a.actor} 已弃牌，不能再行动` });
     const cur = invest.get(actor) || 0;
     const amt = a.amountBB == null ? null : Number(a.amountBB);
     if (amt != null && (!Number.isFinite(amt) || amt < 0)) errors.push({ path, msg: '下注量必须为非负数值' });
@@ -308,6 +348,15 @@ export function validateHand(hand) {
       }
     }
     for (const [k, v] of invest) if (v > maxInvest + 1e-6) errors.push({ path, msg: `${k} 累计投入 ${v.toFixed(1)} BB 超过有效后手 ${maxInvest} BB` });
+    // 下注轮收口判定：弃牌收尾 / 未出局者全部全下 / 全员已行动且无待跟注
+    participants.add(actor);
+    if (a.type === 'FOLD') foldedSet.add(actor);
+    if (a.type === 'ALLIN') allInSet.add(actor);
+    actedSet.add(actor);
+    streetActionCount++;
+    const liveP = [...participants].filter(p => !foldedSet.has(p));
+    const notAllIn = liveP.filter(p => !allInSet.has(p));
+    if (liveP.length <= 1 || notAllIn.length === 0 || (toCall <= 1e-6 && liveP.every(p => actedSet.has(p)))) roundClosed = true;
     if (allInSides.size >= 2) warnings.push('双方已全下：后续行动按 runout 自动补牌处理，不再产生新行动');
     potTrace.push({ idx, street: st, pot: Math.round(pot * 10) / 10, toCall, highest: Math.round(Math.max(0, ...invest.values()) * 10) / 10, lastRaise });
   });
@@ -316,8 +365,8 @@ export function validateHand(hand) {
     if (!Number.isFinite(v) || v < 0) errors.push({ path: 'potBB', msg: '当前底池必须为非负数值' });
     else if (Math.abs(v - pot) > Math.max(2, pot * 0.3)) warnings.push(`录入底池 ${v} BB 与行动流推算 ${pot.toFixed(1)} BB 差异较大，求解将以录入值为准`);
   }
-  const others = [...postActors].filter(p => p !== String(hand.positions.hero).toUpperCase() && p !== String(hand.positions.villain).toUpperCase() && p !== 'HERO' && p !== 'VILLAIN');
-  const solveAllowed = (boardN === 0 || boardN >= 3) && others.length === 0;
+  const others = [...postActors].filter(p => p !== heroPosU && p !== villainPosU && p !== 'HERO' && p !== 'VILLAIN');
+  const solveAllowed = (boardN === 0 || boardN >= 3) && others.length === 0 && !posClash;
   if (!solveAllowed && boardN >= 3) warnings.push('V1.0 仅输出单挑底池求解结果（多人底池可录入归档，但求解不可用）');
   // 当前下注局面，供录入界面生成默认金额 / 按钮可用态（与状态机同一套变量）
   const live = {
@@ -356,55 +405,70 @@ export function actionFlow(hand, street) {
   const lastRaise = last ? last.lastRaise : 1;
 
   const hero = String(hand.positions?.hero || 'BTN').toUpperCase();
-  const villain = String(hand.positions?.villain || 'BB').toUpperCase();
-  const live = [...new Set([hero, villain])];
-  const keyOf = a => {
-    const u = String(a || '').toUpperCase();
-    if (u === hero || u === 'HERO') return 'HERO';
-    if (u === villain || u === 'VILLAIN') return 'VILLAIN';
-    return 'OTHER';
+  let villain = String(hand.positions?.villain || 'BB').toUpperCase();
+  // 位置冲突（如 Hero 改成 BB 后对手仍是 BB）：从行动流推断真实对手，
+  // 否则对手的加注/下注会被当成第三方忽略，出现「己方下注后本街直接结束、没有跟注选项」的错误状态
+  if (villain === hero) villain = inferVillainPosition(hand, null);
+  const norm = raw => {
+    const u = String(raw || '').toUpperCase();
+    return u === 'HERO' ? hero : u === 'VILLAIN' ? villain : u;
   };
-  const order = (si === 0 ? positionsFor(hand.tableSize) : postflopOrder(hand.tableSize)).map(p => String(p).toUpperCase());
-  const rank = p => { const i = order.indexOf(p); return i < 0 ? 99 : i; };
-  const first = live.slice().sort((a, b) => rank(a) - rank(b))[0];
-
+  const sideOf = raw => {
+    const u = norm(raw);
+    return u === hero ? 'HERO' : u === villain ? 'VILLAIN' : u;
+  };
   const allActs = hand.actions || [];
+  // 参与者 = Hero / 对手 + 所有出现过的行动者；弃牌后从 live 剔除（其余位置的弃牌仅记录出局）
+  const participants = new Set([hero, villain].filter(Boolean));
+  for (const a of allActs) participants.add(norm(a.actor));
+  const order = (si === 0 ? positionsFor(hand.tableSize) : postflopOrder(hand.tableSize)).map(p => String(p).toUpperCase());
+  const rank = p => { const i = order.indexOf(String(p).toUpperCase()); return i < 0 ? 99 : i; };
+  const live = [...participants].sort((a, b) => rank(a) - rank(b));
+
   const acts = allActs.filter(a => String(a.street || '').toUpperCase() === st);
   const folded = new Set(), acted = new Set(), responded = new Set();
   let lastAgg = null, handOver = false;
-  // 之前街若 Hero / 对手已弃牌，本手即结束
+  // 之前街已弃牌的玩家持续出局
   for (const a of allActs) {
     if (STREETS.indexOf(String(a.street || '').toUpperCase()) >= si) break;
-    if (a.type === 'FOLD' && keyOf(a.actor) !== 'OTHER') { folded.add(keyOf(a.actor)); handOver = true; }
+    if (a.type === 'FOLD') folded.add(sideOf(a.actor));
   }
   for (const a of acts) {
-    const k = keyOf(a.actor);
-    if (k === 'OTHER') continue;              // 其它位置默认弃牌，不参与顺位
+    const k = sideOf(a.actor);
     acted.add(k);
-    if (a.type === 'FOLD') { folded.add(k); responded.add(k); handOver = true; continue; }
+    if (a.type === 'FOLD') { folded.add(k); responded.add(k); continue; }
     if (a.type === 'BET' || a.type === 'RAISE_TO' || a.type === 'ALLIN') { lastAgg = k; responded.clear(); }
     else if (lastAgg === null) acted.add(k);
     else if (k !== lastAgg) responded.add(k);
   }
-  const need = live.filter(p => !folded.has(keyOf(p)));
+  const liveP = live.filter(p => !folded.has(sideOf(p)));
+  if (liveP.length < 2) handOver = true;
   let closed = false, closedReason = '';
   if (handOver) { closed = true; closedReason = '本手已有一方弃牌'; }
   else if (lastAgg) {
-    closed = need.every(p => keyOf(p) === lastAgg || responded.has(keyOf(p)));
+    closed = liveP.every(p => sideOf(p) === lastAgg || responded.has(sideOf(p)));
     if (closed) closedReason = '下注已被跟注，本街行动结束';
   } else {
-    closed = need.every(p => acted.has(keyOf(p)));
+    closed = liveP.every(p => acted.has(sideOf(p)));
     if (closed) closedReason = '双方均已行动，本街结束';
   }
-  if (!handOver && acts.some(a => a.type === 'ALLIN' && keyOf(a.actor) !== 'OTHER') && toCall === 0) {
+  const allInActors = new Set(allActs.filter(a => a.type === 'ALLIN').map(a => sideOf(a.actor)));
+  if (!handOver && liveP.length >= 2 && liveP.every(p => allInActors.has(p))) {
     closed = true; closedReason = '双方全下，后续自动发牌';
   }
-  const lastLive = [...acts].reverse().find(a => keyOf(a.actor) !== 'OTHER');
+  const first = liveP[0] || live[0] || hero;
   let actor = null;
   if (!closed) {
+    // 顺位：从上一位行动者按座位顺序轮到下一位未弃牌玩家
+    const lastLive = [...acts].reverse().find(a => a.type !== 'FOLD') || acts[acts.length - 1];
     if (lastLive) {
-      const k = keyOf(lastLive.actor);
-      actor = live.find(p => keyOf(p) !== k && !folded.has(keyOf(p))) || first;
+      const lastSide = sideOf(lastLive.actor);
+      const start = liveP.findIndex(p => sideOf(p) === lastSide);
+      for (let i = 1; i <= liveP.length; i++) {
+        const p = liveP[(start + i + liveP.length) % liveP.length];
+        if (sideOf(p) !== lastSide) { actor = p; break; }
+      }
+      if (actor == null) actor = first;
     } else actor = first;
   }
   return {
@@ -445,6 +509,10 @@ export function solveReadiness(hand, stage = null) {
     boardN === 0 ? '尚未选择' : `当前 ${boardN} 张，需 ${need} 张`, 2);
   push('villainCards', villainN === 0 || villainN === 2, '对手手牌为空或 2 张', `当前 ${villainN} 张`, 1);
   push('unique', !v.errors.some(e => e.path === 'cards'), '牌面无重复', '手牌 / 公共牌 / 死牌中存在同一张牌', 1);
+  const heroU = String(hand.positions?.hero || '').toUpperCase();
+  const villainU = String(hand.positions?.villain || '').toUpperCase();
+  push('positions', heroU !== villainU, 'Hero 与对手位置不同',
+    heroU === villainU ? `两家都设成了 ${heroU || '空'}，会分不清谁在行动；请在第 1 步分开` : '', 1);
   push('stack', stack > 0, '有效后手 > 0 BB', '筹码深度缺失', 1);
   const actErrs = v.errors.filter(e => String(e.path).startsWith('actions'));
   push('actions', actErrs.length === 0, '行动流通过状态机校验', actErrs[0] ? actErrs[0].msg : '', 2);
