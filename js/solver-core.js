@@ -335,17 +335,26 @@ function dealLoop(ctx, root, fn) {
   }
   return weight > 0 ? total / weight : 0;
 }
+/* 迭代口径（V1.8）：1 次迭代 = 1 次 CFR 遍历（遍历 1 组 Hero/Villain 牌力档组合），
+ * 与 PioSolver 等商业解算器的 iteration 口径一致。界面显示的次数 = 实际执行的遍历次数。 */
+export const SOLVE_ITER = { fast: 100000, precise: 500000 };
 function runCFR(ctx, root, onProgress, label) {
   const { pH, pV } = ctx;
-  for (let it = 0; it < ctx.iterations; it++) {
-    if (ctx.cancelled) throw new Error('CANCELLED');
-    for (let bh = 0; bh < ctx.NB; bh++) for (let bv = 0; bv < ctx.NB; bv++) {
-      const pD = pH[bh] * pV[bv];
-      if (pD <= 0) continue;
-      cfr(root, bh, bv, 1, 1, pD, ctx);
-    }
-    if (onProgress && (it % 10 === 0 || it === ctx.iterations - 1)) onProgress((it + 1) / ctx.iterations, label);
+  const pairs = [];
+  for (let bh = 0; bh < ctx.NB; bh++) for (let bv = 0; bv < ctx.NB; bv++) {
+    const pD = pH[bh] * pV[bv];
+    if (pD > 0) pairs.push([bh, bv, pD]);
   }
+  if (!pairs.length) return 0;
+  const iters = Math.max(1, Math.floor(ctx.iterations) || 0);
+  const step = Math.max(10, Math.floor(iters / 120));
+  for (let it = 0; it < iters; it++) {
+    if (ctx.cancelled) throw new Error('CANCELLED');
+    const pr = pairs[it % pairs.length]; // 轮转覆盖全部牌力档组合，等价于按序全量扫描
+    cfr(root, pr[0], pr[1], 1, 1, pr[2], ctx);
+    if (onProgress && (it % step === 0 || it === iters - 1)) onProgress((it + 1) / iters, label);
+  }
+  return iters; // 实际执行的迭代次数（用于界面统计，保证显示与执行一致）
 }
 function heatFor(ctx, root, heroCombos, hb, villainCombos, vb, who) {
   const heat = Array.from({ length: 13 }, () => new Array(13).fill(0));
@@ -394,7 +403,8 @@ export function solveCore(req, onProgress = () => {}) {
   if (board.length === 1 || board.length === 2) throw new Error('公共牌需为 0 张（翻前）或 3–5 张（翻后）；当前 1–2 张无法求解');
   const phase = board.length === 0 ? 'preflop' : 'postflop';
   if ((req.sizes || []).length > 4) throw new Error('每街下注尺度最多 4 个，请压缩尺度集合');
-  const iterations = req.iterations || (req.preset === 'precise' ? 420 : 150);
+  // 正式求解（未显式指定迭代数）按档位默认，且至少 10,000 次；显式 iterations 仅供预览/测试
+  const iterations = Math.max(1, Math.floor(req.iterations) || (req.preset === 'precise' ? SOLVE_ITER.precise : SOLVE_ITER.fast));
   const ctx = makeCtx(req, iterations);
   const root = makeRoot(req);
   const treeSize = countTree(ctx, root);
@@ -426,7 +436,7 @@ export function solveCore(req, onProgress = () => {}) {
   ctx.pH = pH; ctx.pV = pV;
 
   onProgress(0.18, '求解均衡策略');
-  runCFR(ctx, root, (p) => onProgress(0.18 + p * 0.62, '求解均衡策略'), 'gto');
+  const itersRun = runCFR(ctx, root, (p) => onProgress(0.18 + p * 0.62, '求解均衡策略'), 'gto');
 
   const rootActs = actionList(root, ctx);
   const avgHero = (state, bucket, acts, c) => avgStrat(c.nodes.get(state.key), 'hero', bucket, acts.length);
@@ -455,11 +465,11 @@ export function solveCore(req, onProgress = () => {}) {
     pot: Math.round(req.pot * 10) / 10, stacks: Math.round(req.stack * 10) / 10,
     actions: rootActs.map((a, i) => ({ type: a.type, sizeBB: a.amount != null ? a.amount : null, label: a.label, freq: gtoFreqRounded[i], ev: Math.round(gtoEV[i] * 100) / 100 })),
     userAction: req.userAction || null, evLossBB,
-    exploitGainBB: null, exploitabilityMbb, iterations, treeSize,
+    exploitGainBB: null, exploitabilityMbb, iterations: itersRun, iterationsExploit: null, treeSize,
     durationMs: Date.now() - t0,
     convergenceNote: phase === 'preflop'
-      ? '翻前近似：起手牌范围对抗权益分档（蒙特卡洛补全 5 张公共牌）+ 街内 CFR；未展开翻后博弈树，不等同商业 Solver 的翻前解，仅供范围对抗参考'
-      : '近似均衡：10 档牌力抽象 + 街内有限博弈树 + CFR 线性平均；可剥削度按牌力分档先验下的最优应对增益估计，非 PioSolver 级精度',
+      ? '翻前近似：起手牌范围对抗权益分档（蒙特卡洛补全 5 张公共牌）+ 街内 CFR；未展开翻后博弈树，不等同商业 Solver 的翻前解，仅供范围对抗参考。迭代口径：1 次迭代 = 1 次 CFR 遍历，统计次数 = 实际执行次数'
+      : '近似均衡：10 档牌力抽象 + 街内有限博弈树 + CFR 线性平均；可剥削度按牌力分档先验下的最优应对增益估计，非 PioSolver 级精度。迭代口径：1 次迭代 = 1 次 CFR 遍历，统计次数 = 实际执行次数',
     ranges: { hero: req.heroRange, villain: villainRange, heroCombos: heroCombos.length, villainCombos: villainCombos.length },
     heatmap: {
       hero: heatFor(ctx, root, heroCombos, hb, villainCombos, vb, 'hero'),
@@ -479,10 +489,10 @@ export function solveCore(req, onProgress = () => {}) {
 
   onProgress(0.83, '节点锁定并求解剥削路线');
   const lockedProvider = (state, bucket, acts, c) => lockedStrategy({ ...ctx, baseNodes: ctx.nodes, locked: true }, state, bucket, acts);
-  const exp = makeCtx(req, Math.max(110, Math.round(iterations * 0.6)));
+  const exp = makeCtx(req, Math.max(8000, Math.round(itersRun * 0.6)));
   exp.E = ctx.E; exp.pH = pH; exp.pV = pV; exp.locked = true; exp.baseNodes = ctx.nodes;
   const expRoot = makeRoot(req);
-  runCFR(exp, expRoot, (p) => onProgress(0.83 + p * 0.15, '节点锁定并求解剥削路线'), 'exploit');
+  const expItersRun = runCFR(exp, expRoot, (p) => onProgress(0.83 + p * 0.15, '节点锁定并求解剥削路线'), 'exploit');
 
   const expHeroStrat = (state, bucket, acts) => avgStrat(exp.nodes.get(state.key), 'hero', bucket, acts.length);
   const gtoVsLocked = dealLoop(ctx, root, (bh, bv, pD) => evaluate(root, bh, bv, pD, ctx, { heroStrat: avgHero, villainStrat: lockedProvider }));
@@ -504,6 +514,7 @@ export function solveCore(req, onProgress = () => {}) {
   return {
     ...base, mode: 'exploit', archetype: req.archetype, intensity: ctx.intensity,
     exploitGainBB, archetypeLabel: (req.archetype || '').toUpperCase(),
+    iterationsExploit: expItersRun,
     actions: rootActs.map((a, i) => ({ type: a.type, sizeBB: a.amount != null ? a.amount : null, label: a.label, freq: expFreqRounded[i], ev: expEV[i] })),
     evLossBB: expUserLoss,
     gtoActions: base.actions,
@@ -558,7 +569,7 @@ export function previewCore(req, chosenActionLabel, onProgress = () => {}) {
   const sub = solveCore({
     ...req, board: newBoard, pot: Math.max(1, req.pot + extra),
     stack: Math.max(1, req.stack - extra / 2), facingBet: 0, oppChecked: true,
-    iterations: 120, preset: 'fast', mode: 'gto', userAction: null,
+    iterations: 30000, preset: 'fast', mode: 'gto', userAction: null,
     decisionNode: (newBoard.length === 3 ? 'FLOP' : newBoard.length === 4 ? 'TURN' : 'RIVER') + '|HERO'
   }, onProgress);
   return {

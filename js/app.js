@@ -12,7 +12,7 @@ import {
   computeStats, sessionNet, sessionBuyin, exportJSON, importJSON, exportSessionsCSV, exportHandHH, downloadText
 } from './db.js';
 import { drawCurve, drawBars, renderHeatmapGrid, buildResultImage } from './charts.js';
-import { solveCore } from './solver-core.js';
+import { solveCore, SOLVE_ITER } from './solver-core.js';
 
 const $ = s => document.querySelector(s);
 const app = $('#app');
@@ -596,7 +596,7 @@ function runLivePreview(key) {
   if (livePreview.key !== key || !wizard) return;
   const h = wizard.hand, street = actStreet(h);
   const req = buildSolveReq(h, selectedDecisionIndex(h));
-  req.iterations = 70; req.preset = 'fast'; // 低迭代，保证交互流畅
+  req.iterations = 15000; req.preset = 'fast'; // 实时预览用较低迭代保证交互流畅（正式解算 ≥ 10,000 次）
   const seq = ++livePreviewSeq;
   const finishWorker = () => { if (livePreviewWorker) { try { livePreviewWorker.terminate(); } catch (e) {} livePreviewWorker = null; } };
   if (typeof Worker === 'undefined') {
@@ -905,7 +905,7 @@ function wizardStep3(h) {
     <label class="field" style="margin-top:8px"><span>自定义尺度（逗号分隔底池倍数，如 0.25,0.75）</span><input type="text" data-bind="customSizes" value="${esc((h.customSizes || []).join(','))}" placeholder="留空则使用上方预设"></label>
     <label class="check"><input type="checkbox" data-bind="allowCheckRaise" ${h.allowCheckRaise ? 'checked' : ''}>允许过牌加注 Check-Raise</label>
     <div class="grid g2" style="margin-top:6px">
-      <label class="field"><span>求解档位</span><select data-bind="preset"><option value="fast" ${h.preset === 'fast' ? 'selected' : ''}>快解（迭代较少）</option><option value="precise" ${h.preset === 'precise' ? 'selected' : ''}>精解（迭代更多）</option></select></label>
+      <label class="field"><span>求解档位</span><select data-bind="preset"><option value="fast" ${h.preset === 'fast' ? 'selected' : ''}>快解（${SOLVE_ITER.fast.toLocaleString('en-US')} 次迭代）</option><option value="precise" ${h.preset === 'precise' ? 'selected' : ''}>精解（${SOLVE_ITER.precise.toLocaleString('en-US')} 次迭代）</option></select></label>
       <label class="field"><span>当前底池覆盖 (BB，留空用推算值)</span><input type="number" step="0.1" min="0.1" data-bind="potOverrideBB" value="${esc(h.potOverrideBB ?? '')}" placeholder="自动推算"></label>
       <label class="field"><span>有效后手覆盖 (BB)</span><input type="number" step="1" min="1" data-bind="stackOverrideBB" value="${esc(h.stackOverrideBB ?? '')}" placeholder="自动推算"></label>
     </div>
@@ -985,7 +985,7 @@ function renderResult(id) {
       ${statLine('推荐主行动', shown.actions.slice().sort((a, b) => b.freq - a.freq)[0]?.label || '—')}
       ${statLine('最优动作 EV', fmt(bestEV) + ' BB')}
       ${statLine('实现 EV 差', shown.evLossBB != null ? fmt(shown.evLossBB) + ' BB' : '未录入实际动作（隐藏）')}
-      ${statLine('收敛信息', `${r.iterations} 次迭代 · ${r.durationMs} ms`)}
+      ${statLine('收敛信息', `${r.iterations.toLocaleString('en-US')} 次 CFR 迭代${r.iterationsExploit ? ` + 剥削 ${r.iterationsExploit.toLocaleString('en-US')} 次` : ''} · ${r.durationMs} ms`)}
       ${statLine('可剥削度', r.exploitabilityMbb != null ? fmt(r.exploitabilityMbb, 1) + ' mbb/hand' : '剥削模式不输出')}
       ${statLine('树规模', (r.treeSize || '—') + ' 节点')}
     </div>
@@ -993,7 +993,7 @@ function renderResult(id) {
   </div>
   ${r.mode === 'exploit' ? renderExploitBlock(r, tab) : ''}
   ${r.gtoActions && tab === 'exploit' ? renderCompareTable(r) : ''}
-  <div class="card"><h2>范围热力图</h2><div class="grid g2"><div id="heatHero"></div><div id="heatVillain"></div></div>
+  <div class="card heat-card"><h2>范围热力图</h2><div class="grid heat-2col"><div id="heatHero"></div><div id="heatVillain"></div></div>
     <div class="tiny muted" style="margin-top:8px">按 13×13 手牌类别聚合并按进攻/加注频率着色；颜色越深频率越高。</div></div>
   <div class="card"><h2>路线预览</h2><div class="small muted">选择动作后，采样一张后续公共牌并快解下一条街（不预展开全树）。</div>
     <div class="chips" style="margin-top:8px">${(r.actions || []).map((a, i) => `<button class="chip" data-act="resPreview" data-id="${esc(job.id)}" data-v="${i}">${esc(a.label || a.type)}</button>`).join('')}</div>
@@ -1006,7 +1006,7 @@ function renderResult(id) {
     <button class="btn" data-act="resRerun" data-id="${esc(job.id)}">调整参数重跑</button>
     <button class="btn" data-act="go" data-v="library">前往牌谱库</button>
   </div></div>
-  <div class="tiny muted">求解口径：${r.phase === 'preflop' ? '翻前近似（起手牌范围权益分档 + 街内 CFR，蒙特卡洛补全公共牌）' : '10 档牌力抽象 + 街内有限博弈树 + CFR 线性平均'}；${r.mode === 'exploit' ? '剥削路线按所选对手画像冻结策略后求解。' : '近似均衡，非商用 Solver 精度。'}</div>`;
+  <div class="tiny muted">求解口径：${r.phase === 'preflop' ? '翻前近似（起手牌范围权益分档 + 街内 CFR，蒙特卡洛补全公共牌）' : '10 档牌力抽象 + 街内有限博弈树 + CFR 线性平均'}；${r.mode === 'exploit' ? '剥削路线按所选对手画像冻结策略后求解。' : '近似均衡，非商用 Solver 精度。'}迭代口径：1 次迭代 = 1 次 CFR 遍历，统计次数 = 实际执行次数。</div>`;
 }
 function progressHtml(job) {
   const p = job.progress || 0;
