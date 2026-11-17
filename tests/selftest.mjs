@@ -474,5 +474,29 @@ River: [Kd5h8sTs5s]  BB check, BTN bet 37.3, BB call 37.3, BB check`;
   ok('收口后多余的过牌被拦截', vo.ok === false && vo.errors.some(e => /下注轮已结束/.test(e.msg)));
 }
 
+console.log('\n[11] V1.9 行动标签口径：具体 BB 尺度 / 加注至语义');
+{
+  // 面对下注：加注标签必须是「加注至 X BB」，禁止「加注 N% 池」类说法
+  const rf = solveCore(makeReq({ facingBet: 9, oppChecked: false, pot: 22.5, iterations: 40 }), () => {});
+  const raise = rf.actions.find(a => a.type === 'RAISE');
+  ok('面对下注时存在加注选项', !!raise, JSON.stringify(rf.actions.map(a => a.type)));
+  ok('加注标签为「加注至 X BB」', !!raise && /^加注至 [\d.]+ BB$/.test(raise.label), raise && raise.label);
+  ok('加注标签与 sizeBB（加注至总额）一致', !!raise && raise.label === `加注至 ${raise.sizeBB} BB`, raise && JSON.stringify({ label: raise.label, sizeBB: raise.sizeBB }));
+  ok('加注至总额 ≥ 面对下注 + 最小加注', !!raise && raise.sizeBB >= 9 + 9 - 1e-6, raise && String(raise.sizeBB));
+  const call = rf.actions.find(a => a.type === 'CALL');
+  ok('跟注标签带具体 BB', !!call && /^跟注 [\d.]+ BB$/.test(call.label), call && call.label);
+  const allin = rf.actions.find(a => a.type === 'ALLIN');
+  if (allin) ok('全下标签带具体 BB', /^全下 [\d.]+ BB$/.test(allin.label), allin.label);
+  ok('面对下注时无「过牌」选项', !rf.actions.some(a => a.type === 'CHECK'), JSON.stringify(rf.actions.map(a => a.type)));
+  ok('全部标签不含「% 池」旧说法', rf.actions.every(a => !String(a.label).includes('% 池')), rf.actions.map(a => a.label).join(' | '));
+
+  // 无人下注：下注标签为「下注 X BB」，含过牌、无加注
+  const rc = solveCore(makeReq({ iterations: 40 }), () => {});
+  const bet = rc.actions.find(a => a.type === 'BET');
+  ok('下注标签为「下注 X BB」', !!bet && /^下注 [\d.]+ BB$/.test(bet.label), bet && bet.label);
+  ok('无人下注时含过牌、无加注', rc.actions.some(a => a.type === 'CHECK') && !rc.actions.some(a => a.type === 'RAISE'));
+  ok('下注标签不含百分比旧说法', rc.actions.every(a => !String(a.label).includes('% 池')));
+}
+
 console.log(`\n结果：${pass} 通过 / ${fail} 失败\n`);
 if (fail) process.exit(1);

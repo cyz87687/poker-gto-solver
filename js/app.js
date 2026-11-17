@@ -409,7 +409,7 @@ function suggestedAmounts(h, live) {
     ALLIN: r1(Number(h.stackBB) || 100)
   };
 }
-/** 下注尺度：按底池比例生成，最多 4 档，去重并裁到后手以内 */
+/** 下注尺度：按当前底池计算，最多 4 档，去重并裁到后手以内；展示以具体 BB 为主 */
 function betSizes(live, stack) {
   const pot = Math.max(0.5, Number(live.pot) || 1);
   const cap = Math.max(0.5, Number(stack) || 100);
@@ -419,10 +419,10 @@ function betSizes(live, stack) {
     if (!(a > 0) || a > cap + 1e-9 || seen.has(a)) return;
     seen.add(a); out.push({ amt: a, label });
   };
-  add(pot * 0.33, '33%'); add(pot * 0.5, '50%'); add(pot * 0.67, '67%'); add(pot, '满池');
+  add(pot * 0.33, '33% 池'); add(pot * 0.5, '50% 池'); add(pot * 0.67, '67% 池'); add(pot, '满池');
   return out.slice(0, 4);
 }
-/** 加注尺度：最小加注 → 2× → 3× → 全下 */
+/** 加注尺度：按当前局面（已下注额 / 最小加注）计算「加注至」总额，展示具体 BB 数 */
 function raiseSizes(live, stack) {
   const highest = Math.max(0, Number(live.highest) || 0);
   const lastRaise = Math.max(1, Number(live.lastRaise) || 1);
@@ -436,9 +436,9 @@ function raiseSizes(live, stack) {
     if (!(a > 0) || a > cap + 1e-9 || seen.has(a)) return;
     seen.add(a); out.push({ amt: a, label });
   };
-  add(minTo, '最小');
-  add(Math.min(cap, minTo * 2), '2×');
-  add(Math.min(cap, minTo * 3), '3×');
+  add(minTo, '最小加注');
+  add(Math.min(cap, minTo * 2), '2× 尺度');
+  add(Math.min(cap, minTo * 3), '3× 尺度');
   add(cap, '全下');
   return out.slice(0, 4);
 }
@@ -479,10 +479,16 @@ function tableHtml(h, street, actor, live) {
     const active = !!activeKey && key === activeKey && !isFolded;
     const amt = inv[key] || 0;
     const tag = side === 'hero' ? 'HERO' : side === 'villain' ? '对手' : '默认弃牌';
+    // 开局录入的起手牌直接显示在座位上（对手手牌仅在已知时显示）
+    const hole = side === 'hero' ? (h.heroCards || []) : side === 'villain' ? (h.villainCards || []) : [];
+    const holeHtml = hole.filter(c => c != null).length
+      ? `<div class="seat-cards">${hole.filter(c => c != null).map(c => `<span class="mini-c ${isRed(c) ? 'red' : ''}">${esc(cardLabel(c))}</span>`).join('')}</div>`
+      : '';
     return `<div class="seat ${side} ${isLive ? 'live' : 'other'} ${isFolded ? 'folded' : ''} ${active ? 'active' : ''}"
       ${isLive ? `data-act="setActorSeat" data-v="${esc(s.name)}" role="button" title="设为当前行动者：${esc(s.name)}"` : ''}
       style="left:${s.left.toFixed(1)}%;top:${s.top.toFixed(1)}%">
       <div class="seat-nm">${esc(s.name)}</div>
+      ${holeHtml}
       <div class="seat-tag">${tag}${amt > 0 ? ' · ' + fmt(amt, 1) : ''}</div>
       ${active ? '<div class="seat-act">● 行动中</div>' : ''}
     </div>`;
@@ -525,52 +531,135 @@ function boardRowForTable(h, n) {
  * 数据保护：本模块只读 wizard.hand 生成求解请求，结果仅存于内存 livePreview；
  * 不调用 upsertHand / upsertJob / persist，不写 IndexedDB / localStorage，不改任何已录入字段。
  */
+/**
+ * 实时预览的目标节点（V1.9）：随牌局状态、已录动作与当前决策动态切换，杜绝展示过期选项。
+ *  - live    轮到 Hero 行动（含对手下注后的待应对）→ 解算「全部已录动作之后」的当前节点
+ *  - review  用户在时间线上显式指定的历史决策点 → 复盘当时局面（标注「复盘」）
+ *  - waiting 轮到对手行动 → 无 Hero 待决策，只展示等待态（不再显示上一节点的过牌等选项）
+ *  - closed  本街 / 手牌已结束 → 提示收口，可点时间线复盘
+ */
+function liveTarget(h, street) {
+  const acts = h.actions || [];
+  const flow = actionFlow(h, street);
+  const di = wizard ? wizard.decisionIndex : null;
+  if (di != null && di >= 0 && di < acts.length && heroDecisionIndices(h).includes(di)) return { mode: 'review', di };
+  if (flow.handOver) return { mode: 'closed', reason: '手牌已结束（有人弃牌或已摊牌）' };
+  if (flow.closed && !ui.act.force) return { mode: 'closed', reason: flow.closedReason || '本街行动已结束' };
+  const actor = nextActorFor(h, street) || flow.first;
+  if (actorKey(h, actor) === 'HERO') return { mode: 'live', di: acts.length, actor };
+  return { mode: 'waiting', actor };
+}
 function liveReqKey(h, street) {
   if (!h) return '';
   const bn = (h.board || []).filter(c => c != null).length;
   if (bn === 1 || bn === 2) return 'incomplete'; // 翻牌未选齐，无法求解
+  const t = liveTarget(h, street);
+  if (t.mode === 'waiting') return 'waiting';
+  if (t.mode === 'closed') return 'closed';
   const need = stageBoardCount(street);
   const board = need === 0 ? [] : (h.board || []).filter(c => c != null).slice(0, need);
-  const di = selectedDecisionIndex(h);
   return JSON.stringify({
     board, hero: h.heroCards, villain: h.villainCards, dead: h.deadCards,
     heroRange: h.rangePresets?.hero, villainRange: h.rangePresets?.villain,
     pot: h.potOverrideBB, stack: h.stackOverrideBB, stackBB: h.stackBB,
     sizes: h.sizes, mode: h.mode, archetype: h.archetype, intensity: h.intensity,
-    di, street, positions: h.positions, tableSize: h.tableSize, actions: (h.actions || []).length
+    di: t.di, review: t.mode === 'review', street, positions: h.positions, tableSize: h.tableSize, actions: (h.actions || []).length
   });
 }
-function liveSolvePanelHtml(h, street) {
-  const need = stageBoardCount(street);
-  const have = (h.board || []).filter(c => c != null).length;
+/** 实时策略建议的简要解释：推荐动作 + 主要判断依据（数据全部来自求解结果与当前局面） */
+function liveWhyHtml(r, req) {
+  const acts = (r.actions || []).filter(a => a && a.label);
+  if (!acts.length) return '';
+  const rec = acts.slice().sort((a, b) => (b.freq - a.freq) || (b.ev - a.ev))[0];
+  const byEV = acts.slice().sort((a, b) => b.ev - a.ev);
+  const second = byEV.find(a => a !== rec);
+  const lines = [];
+  lines.push(`推荐「${esc(rec.label)}」（频率 ${(rec.freq * 100).toFixed(0)}%）：EV ${rec.ev >= 0 ? '+' : ''}${fmt(rec.ev)} BB${second ? `；次优「${esc(second.label)}」EV ${second.ev >= 0 ? '+' : ''}${fmt(second.ev)} BB` : ''}。`);
+  const toCall = Math.max(0, Number(req.facingBet) || 0);
+  const pot = Math.max(0.1, Number(req.pot) || 0.1);
+  const needPct = toCall > 0 ? toCall / (pot + toCall) : null;
+  if (needPct != null) lines.push(`底池赔率：跟注 ${fmt(toCall, 1)} BB 可争夺 ${fmt(pot, 1)} BB 底池，所需权益约 ${(needPct * 100).toFixed(0)}%。`);
+  if (r.focus && Number.isFinite(r.focus.equityVsVillainRange)) {
+    const eq = r.focus.equityVsVillainRange * 100;
+    const verdict = needPct != null
+      ? (eq >= needPct * 100 ? '高于跟注门槛，权益支持继续' : '低于跟注门槛，权益不支持宽跟注')
+      : (eq >= 50 ? '权益过半，具备下注 / 加注的价值基础' : '权益不足半，更宜过牌控制或小尺度施压');
+    lines.push(`你的手牌 ${esc((r.focus.cards || []).join(' '))} 对对手范围权益约 ${eq.toFixed(1)}%，${verdict}。`);
+  }
+  const whyMap = {
+    FOLD: '权益或赔率不足，弃牌止损是长期最优',
+    CHECK: '免费看牌控制底池，同时保留对手下注的诈唬空间',
+    CALL: '跟注的即时赔率与权益匹配，EV 为正',
+    BET: '下注可拒绝对手权益，并从更差牌获取价值',
+    RAISE: '加注向对手范围施压，兼顾价值与弃牌率',
+    ALLIN: '全下最大化弃牌率，被跟注时实现全部权益'
+  };
+  if (whyMap[rec.type]) lines.push(`主要判断依据：${whyMap[rec.type]}。`);
+  return `<div class="live-why"><div class="why-hd">为什么推荐</div>${lines.map(l => `<div class="why-line">${l}</div>`).join('')}</div>`;
+}
+/** 实时面板主体：waiting/closed/incomplete 直接给出状态说明；live/review 走求解状态机 */
+function liveBodyHtml(h, street) {
   const key = liveReqKey(h, street);
-  let body;
+  const t = liveTarget(h, street);
+  const { live } = liveFor(h, street);
   if (key === 'incomplete') {
-    body = `<div class="live-msg">正在选公共牌：还需 ${3 - have} 张即可实时预览翻牌局面</div>`;
-  } else if (livePreview.status === 'error') {
-    body = `<div class="live-msg err">预览不可用：${esc(livePreview.error)}（不影响正式求解）</div>`;
-  } else if (livePreview.status === 'solving' || livePreview.status === 'queued') {
-    body = `<div class="live-msg"><span class="live-spin"></span> 正在计算实时策略 · ${Math.round(livePreview.pct * 100)}%</div>
+    const have = (h.board || []).filter(c => c != null).length;
+    return `<div class="live-msg">正在选公共牌：还需 ${3 - have} 张即可实时预览翻牌局面</div>`;
+  }
+  if (key === 'waiting') {
+    const toCall = Math.max(0, Number(live.toCall) || 0);
+    return `<div class="live-msg"><span class="live-spin"></span> 轮到对手（${esc(t.actor || '—')}）行动${toCall > 0 ? ` · 对手需跟注 ${fmt(toCall, 1)} BB` : ''} · 底池 ${fmt(live.pot, 1)} BB</div>
+      <div class="tiny muted" style="padding:0 2px 8px">你已行动，当前没有 Hero 待决策——为避免误导，不再显示上一节点的过牌等过期选项。对手动作录入后本面板自动重算；点时间线中自己的动作可复盘当时的决策。</div>`;
+  }
+  if (key === 'closed') {
+    return `<div class="live-msg">✓ ${esc(t.reason || '本街行动已结束')} · 底池 ${fmt(live.pot, 1)} BB</div>
+      <div class="tiny muted" style="padding:0 2px 8px">当前没有实时决策；点时间线中 Hero 的动作可复盘当时的策略。</div>`;
+  }
+  const done = livePreview.status === 'done' && livePreview.result && livePreview.key === key;
+  if (livePreview.status === 'error' && livePreview.key === key) {
+    return `<div class="live-msg err">预览不可用：${esc(livePreview.error)}（不影响正式解算）</div>`;
+  }
+  if (!done && (livePreview.status === 'solving' || livePreview.status === 'queued') && livePreview.key === key) {
+    return `<div class="live-msg"><span class="live-spin"></span> 正在计算实时策略 · ${Math.round(livePreview.pct * 100)}%</div>
       <div class="progress" style="margin-top:6px"><i style="width:${(livePreview.pct * 100).toFixed(0)}%"></i></div>`;
-  } else if (livePreview.status === 'done' && livePreview.result && livePreview.key === key) {
+  }
+  if (done) {
     const r = livePreview.result;
     const acts = (r.actions || []).slice();
     const maxF = Math.max(0.0001, ...acts.map(a => a.freq));
     const bestEV = Math.max(0, ...acts.map(a => a.ev));
-    body = `<div class="live-head"><span class="live-node">${esc(r.decisionNode || '')}</span><span class="tiny muted">底池 ${fmt(r.pot, 1)} BB · ${r.iterations} 次迭代</span></div>
+    let req = null;
+    try { req = buildSolveReq(h, t.di); } catch (e) { req = { pot: r.pot, facingBet: 0 }; }
+    const modeTag = t.mode === 'review'
+      ? `<span class="live-tag review">复盘 #${t.di + 1} · 当时局面</span>`
+      : `<span class="live-tag">实时决策 · 轮到 ${esc(t.actor || 'Hero')}</span>`;
+    return `<div class="live-head"><span class="live-node">${esc(r.decisionNode || '')}</span><span class="tiny muted">底池 ${fmt(r.pot, 1)} BB · ${r.iterations} 次迭代</span></div>
+      <div style="margin-bottom:6px">${modeTag}</div>
       <div class="live-bars">${acts.map((a, i) => `<div class="live-row ${a.ev >= bestEV - 1e-9 ? 'best' : ''}">
         <span class="live-act">${esc(a.label || a.type)}</span>
         <div class="live-track"><i style="width:${(a.freq / maxF * 100).toFixed(0)}%;animation-delay:${(i * 40)}ms"></i></div>
         <span class="live-freq">${(a.freq * 100).toFixed(0)}%</span>
         <span class="live-ev ${pnlCls(a.ev)}">${a.ev >= 0 ? '+' : ''}${fmt(a.ev)}</span>
-      </div>`).join('')}</div>`;
-  } else if (livePreview.status === 'unsupported') {
-    body = `<div class="live-msg">当前环境不支持后台线程，实时预览已停用（不影响正式求解）</div>`;
-  } else {
-    body = `<div class="live-msg muted-t">策略将随公共牌 / 动作 / 参数选择自动刷新</div>`;
+      </div>`).join('')}</div>
+      ${liveWhyHtml(r, req)}`;
   }
+  if (livePreview.status === 'unsupported') {
+    return `<div class="live-msg">当前环境不支持后台线程，实时预览已停用（不影响正式解算）</div>`;
+  }
+  return `<div class="live-msg muted-t">策略将随公共牌 / 动作 / 参数选择自动刷新</div>`;
+}
+function liveBadgeHtml(key) {
+  if (key === 'waiting') return { cls: 'waiting', text: '等对手' };
+  if (key === 'closed') return { cls: 'closed', text: '已收口' };
+  const map = { idle: '待命', queued: '排队', solving: '求解中', done: '已就绪', error: '不可用', unsupported: '停用' };
+  return { cls: livePreview.status, text: map[livePreview.status] || livePreview.status };
+}
+function liveSolvePanelHtml(h, street) {
+  const key = liveReqKey(h, street);
+  const body = liveBodyHtml(h, street);
+  const badge = liveBadgeHtml(key);
   return `<div class="card live-card"><div class="card-title"><h2>实时策略预览</h2>
-    <span class="live-badge ${livePreview.status}" id="liveBadge">${{ idle: '待命', queued: '排队', solving: '求解中', done: '已就绪', error: '不可用', unsupported: '停用' }[livePreview.status] || livePreview.status}</span></div>
+    <span class="live-badge ${badge.cls}" id="liveBadge">${badge.text}</span></div>
     <div class="live-body" id="liveBodyWrap">${body}</div>
     <div class="tiny muted" style="margin-top:6px">随每次选择即时重算（低迭代快解，仅用于交互反馈；正式结果以「开始解算」为准）。数据只读取当前录入内容，不写入也不覆盖已有数据。</div>
   </div>`;
@@ -581,10 +670,10 @@ function scheduleLivePreview() {
   if (name !== 'new' || !wizard || wizard.step !== 2) return;
   const h = wizard.hand, street = actStreet(h);
   const key = liveReqKey(h, street);
-  if (key === 'incomplete') {
-    livePreview = { key: 'incomplete', status: 'idle', result: null, pct: 0, error: '' };
-    const box = $('#liveBody');
-    if (box) box.outerHTML = ''; // 由下一次 render 重建占位
+  if (key === 'incomplete' || key === 'waiting' || key === 'closed') {
+    // 无需求解的实时决策（选牌中 / 等对手 / 已收口）：直接刷新状态说明
+    livePreview = { key, status: 'idle', result: null, pct: 0, error: '' };
+    updateLiveBody();
     return;
   }
   if (key === livePreview.key && (livePreview.status === 'done' || livePreview.status === 'solving' || livePreview.status === 'queued')) return;
@@ -595,7 +684,9 @@ function scheduleLivePreview() {
 function runLivePreview(key) {
   if (livePreview.key !== key || !wizard) return;
   const h = wizard.hand, street = actStreet(h);
-  const req = buildSolveReq(h, selectedDecisionIndex(h));
+  const t = liveTarget(h, street);
+  if (t.mode !== 'live' && t.mode !== 'review') { updateLiveBody(); return; }
+  const req = buildSolveReq(h, t.di);
   req.iterations = 15000; req.preset = 'fast'; // 实时预览用较低迭代保证交互流畅（正式解算 ≥ 10,000 次）
   const seq = ++livePreviewSeq;
   const finishWorker = () => { if (livePreviewWorker) { try { livePreviewWorker.terminate(); } catch (e) {} livePreviewWorker = null; } };
@@ -629,30 +720,15 @@ function updateLiveBody() {
   const h = wizard && wizard.hand, street = h && actStreet(h);
   if (!h) return;
   const wrap = $('#liveBodyWrap');
-  if (!wrap) { return; }
-  const need = stageBoardCount(street), have = (h.board || []).filter(c => c != null).length;
+  if (!wrap) return;
   const key = liveReqKey(h, street);
-  let body;
-  if (livePreview.status === 'solving' || livePreview.status === 'queued') {
-    body = `<div class="live-msg"><span class="live-spin"></span> 正在计算实时策略 · ${Math.round(livePreview.pct * 100)}%</div>
-      <div class="progress" style="margin-top:6px"><i style="width:${(livePreview.pct * 100).toFixed(0)}%"></i></div>`;
-  } else if (livePreview.status === 'done' && livePreview.result && livePreview.key === key) {
-    const r = livePreview.result, acts = (r.actions || []).slice();
-    const maxF = Math.max(0.0001, ...acts.map(a => a.freq));
-    const bestEV = Math.max(0, ...acts.map(a => a.ev));
-    body = `<div class="live-head"><span class="live-node">${esc(r.decisionNode || '')}</span><span class="tiny muted">底池 ${fmt(r.pot, 1)} BB · ${r.iterations} 次迭代</span></div>
-      <div class="live-bars">${acts.map((a, i) => `<div class="live-row ${a.ev >= bestEV - 1e-9 ? 'best' : ''}">
-        <span class="live-act">${esc(a.label || a.type)}</span>
-        <div class="live-track"><i style="width:${(a.freq / maxF * 100).toFixed(0)}%;animation-delay:${(i * 40)}ms"></i></div>
-        <span class="live-freq">${(a.freq * 100).toFixed(0)}%</span>
-        <span class="live-ev ${pnlCls(a.ev)}">${a.ev >= 0 ? '+' : ''}${fmt(a.ev)}</span>
-      </div>`).join('')}</div>`;
-  } else if (livePreview.status === 'error') {
-    body = `<div class="live-msg err">预览不可用：${esc(livePreview.error)}（不影响正式求解）</div>`;
-  }
-  if (body) wrap.innerHTML = body;
+  wrap.innerHTML = liveBodyHtml(h, street);
   const badge = $('#liveBadge');
-  if (badge) { badge.className = 'live-badge ' + livePreview.status; badge.textContent = { idle: '待命', queued: '排队', solving: '求解中', done: '已就绪', error: '不可用', unsupported: '停用' }[livePreview.status] || livePreview.status; }
+  if (badge) {
+    const b = liveBadgeHtml(key);
+    badge.className = 'live-badge ' + b.cls;
+    badge.textContent = b.text;
+  }
 }
 /** 停止实时预览（进入正式求解 / 离开向导时调用），不触碰持久化数据 */
 function stopLivePreview() {
@@ -672,7 +748,7 @@ function sizeActionCard(type, title, sub, opts, dis, reason) {
   if (dis) return simpleActionCard(type, title, '', true, reason);
   return `<div class="ac ac-size ac-${type.toLowerCase()}">
     <div class="ac-main"><b>${esc(title)}</b><span class="ac-sub">${esc(sub)}</span></div>
-    <div class="ac-sizes">${opts.map(o => `<button class="sz" data-act="quickAction" data-v="${type}" data-amt="${o.amt}"><em>${o.label}</em><b>${fmt(o.amt, 1)}</b></button>`).join('')}
+    <div class="ac-sizes">${opts.map(o => `<button class="sz" data-act="quickAction" data-v="${type}" data-amt="${o.amt}"><b>${fmt(o.amt, 1)}<i>BB</i></b><em>${o.label}</em></button>`).join('')}
       <button class="sz sz-custom" data-act="quickAction" data-v="${type}" data-amt="custom"><b>自定义</b></button></div>
   </div>`;
 }
@@ -689,30 +765,40 @@ function streetDoneHtml(h, street, flow) {
       <button class="btn sm" data-act="forceAct">仍要在本街补录</button>
     </div></div>`;
 }
+/**
+ * 操作选项展示规则（V1.9）：只展示当前局面下合法且有意义的选项，无效选项直接不渲染。
+ *  - 面对下注/加注（toCall>0）：弃牌 / 跟注 / 加注至 / 全下 —— 无「过牌」「下注」
+ *  - 无人下注（toCall=0）：过牌 / 下注 / 全下 —— 无「跟注」「加注」，可免费过牌时不提供「弃牌」
+ * 尺度选项按当前局面计算，以具体 BB（加注至 X BB / 下注 X BB）展示。
+ */
 function actionCardsHtml(h, live, toCall, street, flow) {
   if (flow.closed && !ui.act.force) return streetDoneHtml(h, street, flow);
   const stack = Math.max(0, Number(h.stackBB) || 100);
   const pot = Math.max(0.5, Number(live.pot) || 1);
-  const sug = suggestedAmounts(h, live);
   const facing = toCall > 0;
   const preflop = street === 'PREFLOP';
   const callAmt = Math.min(toCall, stack);
   const out = [], notes = [];
-  out.push(simpleActionCard('FOLD', '弃牌', '放弃本手，已投入的筹码不收回', false, ''));
   if (preflop && facing) {
     // 翻前面对大盲 / 加注，规则上不存在过牌；只有大盲期权（待跟注额为 0）时才出现
     notes.push('翻前面对大盲 / 加注时没有「过牌」选项（对手已下注，此时不能过牌），只能弃牌、跟注或加注。');
-  } else {
-    const bbOption = preflop && !facing && (h.actions || []).some(a => String(a.street).toUpperCase() === 'PREFLOP' && a.type === 'CALL');
-    out.push(simpleActionCard('CHECK', bbOption ? '过牌（大盲期权）' : '过牌',
-      bbOption ? '无人再加注，保留大盲期权直接看翻牌' : '不投入，把行动权交给对手',
-      facing, '对手已下注，此时不能过牌'));
   }
-  out.push(simpleActionCard('CALL', facing ? `跟注 ${fmt(callAmt, 1)}` : '跟注', facing ? `投入 ${fmt(callAmt, 1)} BB 匹配对手下注` : '', !facing, '无人下注，无需跟注'));
-  const betTitle = preflop && !facing ? '加注（大盲期权）' : '下注';
-  out.push(sizeActionCard('BET', betTitle, `主动投入 · 底池 ${fmt(pot, 1)} BB`, betSizes(live, stack), facing, '对手已下注，应使用「加注」'));
-  const minTo = Math.max(0, Number(live.highest) || 0) + Math.max(1, Number(live.lastRaise) || 1);
-  out.push(sizeActionCard('RAISE_TO', '加注', minTo > 0 ? `本街投入提到 ${fmt(minTo, 1)} BB 起` : '把本街投入提高到指定额', raiseSizes(live, stack), !facing, '无人下注，应使用「下注」'));
+  if (facing) {
+    notes.push(`面对下注 / 加注：不提供「过牌」「下注」；加注按当前局面计算，以「加注至 X BB」展示具体尺度。`);
+    out.push(simpleActionCard('FOLD', '弃牌', '放弃本手，已投入的筹码不收回', false, ''));
+    out.push(simpleActionCard('CALL', `跟注 ${fmt(callAmt, 1)}`, `投入 ${fmt(callAmt, 1)} BB 匹配对手下注`, false, ''));
+    const minTo = Math.max(0, Number(live.highest) || 0) + Math.max(1, Number(live.lastRaise) || 1);
+    out.push(sizeActionCard('RAISE_TO', '加注至', `面对 ${fmt(Number(live.highest) || 0, 1)} BB · 最小加注至 ${fmt(minTo, 1)} BB`, raiseSizes(live, stack), false, ''));
+  } else {
+    notes.push('无人下注：不提供「跟注 / 加注」；可免费过牌时「弃牌」无意义，也不提供。');
+    const bbOption = preflop && (h.actions || []).some(a => String(a.street).toUpperCase() === 'PREFLOP' && a.type === 'CALL');
+    out.push(simpleActionCard('CHECK', bbOption ? '过牌（大盲期权）' : '过牌',
+      bbOption ? '无人再加注，保留大盲期权直接看翻牌' : '不投入，把行动权交给对手', false, ''));
+    const betTitle = preflop ? '加注（大盲期权）' : '下注';
+    out.push(sizeActionCard('BET', betTitle,
+      preflop ? `主动加注 · 底池 ${fmt(pot, 1)} BB，按比例给出加注额` : `主动下注 · 底池 ${fmt(pot, 1)} BB`,
+      betSizes(live, stack), false, ''));
+  }
   out.push(simpleActionCard('ALLIN', `全下 ${fmt(stack, 1)}`, `投入全部后手 ${fmt(stack, 1)} BB`, stack <= 0.5, '后手不足'));
   return `<div class="ac-grid">${out.join('')}</div>
     ${notes.map(n => `<div class="ac-note">${esc(n)}</div>`).join('')}
@@ -975,7 +1061,7 @@ function renderResult(id) {
     <div class="table-wrap"><table class="ev-table"><thead><tr><th>动作</th><th class="num">${tab === 'exploit' ? '剥削频率' : '均衡频率'}</th><th class="num">动作 EV</th><th>标签</th></tr></thead><tbody>
       ${shown.actions.map((a, i) => {
         const badge = a.freq >= 0.66 ? '<span class="badge hi">高频</span>' : a.freq >= 0.33 ? '<span class="badge mid">混合</span>' : a.freq > 0 ? '<span class="badge lo">低频</span>' : '<span class="badge zero">零频率</span>';
-        return `<tr class="${a.ev >= bestEV - 1e-9 ? 'hl' : ''}"><td>${esc(a.label || a.type)}${a.sizeBB != null ? ` <span class="tiny muted">${fmt(a.sizeBB, 1)} BB</span>` : ''}</td>
+        return `<tr class="${a.ev >= bestEV - 1e-9 ? 'hl' : ''}"><td>${esc(a.label || a.type)}${a.sizeBB != null && !String(a.label || '').includes(' BB') ? ` <span class="tiny muted">${fmt(a.sizeBB, 1)} BB</span>` : ''}</td>
           <td class="num">${(a.freq * 100).toFixed(1)}%<div class="bar" style="margin-top:3px"><i style="width:${(a.freq / maxFreq * 100).toFixed(0)}%"></i></div></td>
           <td class="num ${a.ev >= 0 ? 'up' : 'down'}">${fmt(a.ev)}</td><td>${badge}</td></tr>`;
       }).join('')}

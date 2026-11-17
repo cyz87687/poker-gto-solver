@@ -74,30 +74,50 @@ function actionList(s, ctx) {
   const rem = Math.min(remFor(s, 'hero'), remFor(s, 'villain'));
   const A = t => acts.push(t);
   if (s.allin) {
-    if (s.toCall > 0) { A({ type: 'FOLD', key: 'F', label: '弃牌' }); A({ type: 'CALL', amount: Math.min(s.toCall, rem), key: 'C', label: '跟注' }); }
+    if (s.toCall > 0) {
+      const callAmt = Math.min(s.toCall, rem);
+      A({ type: 'FOLD', key: 'F', label: '弃牌' });
+      A({ type: 'CALL', amount: callAmt, key: 'C', label: `跟注 ${(Math.round(callAmt * 10) / 10).toFixed(1)} BB` });
+    }
     else A({ type: 'CHECK', key: 'X', label: '过牌' });
     return finish(acts);
   }
   if (s.toCall > 0) {
     A({ type: 'FOLD', key: 'F', label: '弃牌' });
-    A({ type: 'CALL', amount: Math.min(s.toCall, rem), key: 'C', label: '跟注' });
+    const callAmt = Math.min(s.toCall, rem);
+    A({ type: 'CALL', amount: callAmt, key: 'C', label: `跟注 ${(Math.round(callAmt * 10) / 10).toFixed(1)} BB` });
     const canRaise = s.raises < ctx.maxRaises && !(ctx.checkRaise === false && s.afterCheck);
     if (canRaise && rem > s.toCall + 0.5) {
       const pool = s.pot + s.toCall;
+      const actorInv = inv(s, s.toAct);
       for (const size of ctx.sizes) {
         const inc = clamp(size * pool, s.toCall, Math.max(s.toCall, rem - s.toCall));
-        if (inc > s.toCall + 0.2) acts.push({ type: 'RAISE', amount: Math.round(inc * 10) / 10, size, key: 'R' + size, label: `加注 ${Math.round(size * 100)}% 池` });
+        if (inc > s.toCall + 0.2) {
+          // 展示口径：加注至 = 行动者本街总投入（已投入 + 跟注 + 加注增量），直接给具体 BB 数
+          const incR = Math.round(inc * 10) / 10;
+          const raiseTo = Math.round((actorInv + s.toCall + incR) * 10) / 10;
+          acts.push({ type: 'RAISE', amount: incR, raiseTo, size, key: 'R' + size, label: `加注至 ${raiseTo.toFixed(1)} BB` });
+        }
       }
-      if (rem > s.toCall * 2 && rem <= 3.2 * s.pot) acts.push({ type: 'ALLIN', amount: Math.round((rem - 0) * 10) / 10, key: 'AI', label: '全下' });
+      if (rem > s.toCall * 2 && rem <= 3.2 * s.pot) {
+        const aiAmt = Math.round(rem * 10) / 10;
+        acts.push({ type: 'ALLIN', amount: aiAmt, key: 'AI', label: `全下 ${aiAmt.toFixed(1)} BB` });
+      }
     }
   } else {
     A({ type: 'CHECK', key: 'X', label: '过牌' });
     if (s.raises < ctx.maxRaises && rem > 0.6) {
       for (const size of ctx.sizes) {
         const amt = clamp(size * s.pot, 1, rem);
-        if (amt >= 0.9) acts.push({ type: 'BET', amount: Math.round(amt * 10) / 10, size, key: 'B' + size, label: `下注 ${Math.round(size * 100)}% 池` });
+        if (amt >= 0.9) {
+          const amtR = Math.round(amt * 10) / 10;
+          acts.push({ type: 'BET', amount: amtR, size, key: 'B' + size, label: `下注 ${amtR.toFixed(1)} BB` });
+        }
       }
-      if (rem <= 3.2 * s.pot && rem > 1.2) acts.push({ type: 'ALLIN', amount: Math.round(rem * 10) / 10, key: 'AI', label: '全下' });
+      if (rem <= 3.2 * s.pot && rem > 1.2) {
+        const aiAmt = Math.round(rem * 10) / 10;
+        acts.push({ type: 'ALLIN', amount: aiAmt, key: 'AI', label: `全下 ${aiAmt.toFixed(1)} BB` });
+      }
     }
   }
   // 去重（尺度裁剪后可能生成相同 key）
@@ -463,7 +483,7 @@ export function solveCore(req, onProgress = () => {}) {
     mode: 'gto', archetype: null, phase, boardCount: board.length,
     decisionNode: req.decisionNode || (phase === 'preflop' ? 'PREFLOP|HERO' : 'FLOP|HERO'),
     pot: Math.round(req.pot * 10) / 10, stacks: Math.round(req.stack * 10) / 10,
-    actions: rootActs.map((a, i) => ({ type: a.type, sizeBB: a.amount != null ? a.amount : null, label: a.label, freq: gtoFreqRounded[i], ev: Math.round(gtoEV[i] * 100) / 100 })),
+    actions: rootActs.map((a, i) => ({ type: a.type, sizeBB: a.raiseTo != null ? a.raiseTo : (a.amount != null ? a.amount : null), label: a.label, freq: gtoFreqRounded[i], ev: Math.round(gtoEV[i] * 100) / 100 })),
     userAction: req.userAction || null, evLossBB,
     exploitGainBB: null, exploitabilityMbb, iterations: itersRun, iterationsExploit: null, treeSize,
     durationMs: Date.now() - t0,
@@ -515,7 +535,7 @@ export function solveCore(req, onProgress = () => {}) {
     ...base, mode: 'exploit', archetype: req.archetype, intensity: ctx.intensity,
     exploitGainBB, archetypeLabel: (req.archetype || '').toUpperCase(),
     iterationsExploit: expItersRun,
-    actions: rootActs.map((a, i) => ({ type: a.type, sizeBB: a.amount != null ? a.amount : null, label: a.label, freq: expFreqRounded[i], ev: expEV[i] })),
+    actions: rootActs.map((a, i) => ({ type: a.type, sizeBB: a.raiseTo != null ? a.raiseTo : (a.amount != null ? a.amount : null), label: a.label, freq: expFreqRounded[i], ev: expEV[i] })),
     evLossBB: expUserLoss,
     gtoActions: base.actions,
     gtoEvLossBB: base.evLossBB,
@@ -532,7 +552,12 @@ function matchUserAction(acts, user) {
   if (idx < 0 && t === 'BET') idx = acts.findIndex(a => a.type === 'ALLIN');
   if (user.amountBB != null && idx >= 0) {
     let best = idx, d = Infinity;
-    acts.forEach((a, i) => { if (a.type !== acts[idx].type) return; const dd = Math.abs((a.amount || 0) - user.amountBB); if (dd < d) { d = dd; best = i; } });
+    acts.forEach((a, i) => {
+      if (a.type !== acts[idx].type) return;
+      // RAISE 的 amount 是加注增量，用户录入的 amountBB 是「加注至」总额 → 用 raiseTo 对齐
+      const dd = Math.abs(((a.raiseTo != null ? a.raiseTo : a.amount) || 0) - user.amountBB);
+      if (dd < d) { d = dd; best = i; }
+    });
     idx = best;
   }
   return idx;
