@@ -361,3 +361,22 @@ canvas{max-width:100%;display:block}
   .heat-grid .cell{font-size:clamp(7px,2.6vw,10px);border-radius:2px}
   .heat-grid .hdr{font-size:clamp(7px,2.4vw,9px)}
 }
+
+/* ===== V1.10 决策面板（预览与选项合并） ===== */
+.decision-panel .dp-node{display:flex;flex-wrap:wrap;align-items:center;gap:8px;font-size:12px;color:var(--text-2);background:var(--surface-2);border-radius:8px;padding:8px 10px;margin:2px 0 8px}
+.decision-panel .dp-sub{font-size:11px;font-weight:700;color:var(--text-3);margin:10px 0 4px;letter-spacing:.4px}
+.decision-panel .dp-cards{margin-top:2px}
+.ac{flex-wrap:wrap}
+.ac-stat{display:flex;align-items:center;gap:6px;flex-basis:100%;margin-top:6px;font-size:10.5px;color:var(--text-3)}
+.ac-stat .ac-bar{flex:1;height:4px;border-radius:2px;background:rgba(120,130,150,.18);overflow:hidden;min-width:40px}
+.ac-stat .ac-bar i{display:block;height:100%;border-radius:2px;background:var(--accent)}
+.ac-stat.best .ac-bar i{background:#1a8a4a}
+.ac-stat .ac-freq{font-variant-numeric:tabular-nums;min-width:32px;text-align:right;font-weight:600;color:var(--text-2)}
+.ac-stat .ac-ev{font-variant-numeric:tabular-nums;font-weight:700;min-width:52px;text-align:right}
+.ac-stat .ac-rec{background:#e6f7ee;color:#1a8a4a;border-radius:8px;padding:0 6px;font-size:9.5px;font-weight:700}
+.sz .ac-stat{flex-basis:auto;width:100%;margin-top:3px;gap:3px;font-size:9px}
+.sz .ac-stat .ac-bar{height:3px;min-width:18px}
+.sz .ac-stat .ac-freq{min-width:24px;font-size:8.5px}
+.sz .ac-stat .ac-ev{min-width:0;font-size:8.5px}
+.sz .ac-stat .ac-rec{display:none}
+@media(max-width:520px){.decision-panel .dp-node{font-size:11px}.ac-stat{font-size:10px}}

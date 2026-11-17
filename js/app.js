@@ -399,14 +399,16 @@ function liveFor(h, street) {
     live: { pot: f.pot, toCall: f.toCall, highest: f.highest, lastRaise: f.lastRaise, street }
   };
 }
-function suggestedAmounts(h, live) {
+function suggestedAmounts(h, live, eff = null, side = null) {
   const r1 = x => Math.round(x * 10) / 10;
+  const rem = eff && side ? Math.max(0, (eff.rem && eff.rem[side]) || 0) : Math.max(0, Number(h.stackBB) || 100);
+  const cur = eff && side ? ((eff.streetInv && eff.streetInv[side]) || 0) : 0;
   return {
     FOLD: null, CHECK: null,
-    CALL: r1(Number(live.toCall) || 0),
+    CALL: r1(Math.min(Number(live.toCall) || 0, rem)),
     BET: r1(Math.max(1, (Number(live.pot) || 1.5) * 0.67)),
     RAISE_TO: r1(Math.max(3, (Number(live.highest) || 0) + (Number(live.lastRaise) || 1) * 3)),
-    ALLIN: r1(Number(h.stackBB) || 100)
+    ALLIN: r1(cur + rem)
   };
 }
 /** 下注尺度：按当前底池计算，最多 4 档，去重并裁到后手以内；展示以具体 BB 为主 */
@@ -567,8 +569,8 @@ function liveReqKey(h, street) {
   });
 }
 /** 实时策略建议的简要解释：推荐动作 + 主要判断依据（数据全部来自求解结果与当前局面） */
-function liveWhyHtml(r, req) {
-  const acts = (r.actions || []).filter(a => a && a.label);
+function liveWhyHtml(r, req, actsIn = null) {
+  const acts = ((actsIn && actsIn.length ? actsIn : r.actions) || []).filter(a => a && a.label);
   if (!acts.length) return '';
   const rec = acts.slice().sort((a, b) => (b.freq - a.freq) || (b.ev - a.ev))[0];
   const byEV = acts.slice().sort((a, b) => b.ev - a.ev);
@@ -625,23 +627,25 @@ function liveBodyHtml(h, street) {
   }
   if (done) {
     const r = livePreview.result;
-    const acts = (r.actions || []).slice();
+    const acts = displayActs(r);
     const maxF = Math.max(0.0001, ...acts.map(a => a.freq));
     const bestEV = Math.max(0, ...acts.map(a => a.ev));
     let req = null;
     try { req = buildSolveReq(h, t.di); } catch (e) { req = { pot: r.pot, facingBet: 0 }; }
-    const modeTag = t.mode === 'review'
-      ? `<span class="live-tag review">复盘 #${t.di + 1} · 当时局面</span>`
-      : `<span class="live-tag">实时决策 · 轮到 ${esc(t.actor || 'Hero')}</span>`;
-    return `<div class="live-head"><span class="live-node">${esc(r.decisionNode || '')}</span><span class="tiny muted">底池 ${fmt(r.pot, 1)} BB · ${r.iterations} 次迭代</span></div>
-      <div style="margin-bottom:6px">${modeTag}</div>
+    const handTag = r.focus && (r.focus.cards || []).length ? ` · 频率按手牌 ${esc(r.focus.cards.join(' '))}` : '';
+    // 复盘模式：历史节点策略在此行内展示；实时模式的频率/EV 已内联到下方选项卡片
+    const rows = t.mode === 'review'
+      ? `<div class="dp-sub">复盘 #${t.di + 1} · 当时局面（仅展示，点时间线可切换）</div>
       <div class="live-bars">${acts.map((a, i) => `<div class="live-row ${a.ev >= bestEV - 1e-9 ? 'best' : ''}">
         <span class="live-act">${esc(a.label || a.type)}</span>
         <div class="live-track"><i style="width:${(a.freq / maxF * 100).toFixed(0)}%;animation-delay:${(i * 40)}ms"></i></div>
         <span class="live-freq">${(a.freq * 100).toFixed(0)}%</span>
         <span class="live-ev ${pnlCls(a.ev)}">${a.ev >= 0 ? '+' : ''}${fmt(a.ev)}</span>
-      </div>`).join('')}</div>
-      ${liveWhyHtml(r, req)}`;
+      </div>`).join('')}</div>`
+      : '';
+    return `<div class="live-head"><span class="live-node">${esc(r.decisionNode || '')}</span><span class="tiny muted">底池 ${fmt(r.pot, 1)} BB · ${r.iterations} 次 CFR 迭代${handTag}</span></div>
+      ${rows}
+      ${liveWhyHtml(r, req, acts)}`;
   }
   if (livePreview.status === 'unsupported') {
     return `<div class="live-msg">当前环境不支持后台线程，实时预览已停用（不影响正式解算）</div>`;
@@ -654,13 +658,101 @@ function liveBadgeHtml(key) {
   const map = { idle: '待命', queued: '排队', solving: '求解中', done: '已就绪', error: '不可用', unsupported: '停用' };
   return { cls: livePreview.status, text: map[livePreview.status] || livePreview.status };
 }
-function liveSolvePanelHtml(h, street) {
+/* ---------- 决策面板（V1.10：实时策略预览与操作选项合二为一） ---------- */
+/** 求解行动列表：已知 Hero 手牌时优先展示「该手牌」的条件频率（focus.strategy），否则为节点混合频率 */
+function displayActs(res) {
+  const acts = ((res && res.actions) || []).map(a => ({ ...a }));
+  const fs = res && res.focus && res.focus.strategy;
+  if (fs && fs.length === acts.length) acts.forEach((a, i) => { if (Number.isFinite(fs[i].freq)) a.freq = fs[i].freq; });
+  return acts;
+}
+function statLookup(acts) {
+  const m = { FOLD: null, CHECK: null, CALL: null, ALLIN: null, BET: [], RAISE: [] };
+  for (const a of acts) {
+    if (a.type === 'BET') m.BET.push(a);
+    else if (a.type === 'RAISE') m.RAISE.push(a);
+    else if (a.type in m) m[a.type] = a;
+  }
+  return m;
+}
+function pickStat(list, amt) {
+  if (!list || !list.length || !Number.isFinite(amt)) return null;
+  let best = null, d = Infinity;
+  for (const x of list) {
+    const dd = Math.abs((x.sizeBB != null ? x.sizeBB : (x.amount != null ? x.amount : 0)) - amt);
+    if (dd < d) { d = dd; best = x; }
+  }
+  return d <= Math.max(0.6, Math.abs(amt) * 0.12) ? best : null;
+}
+/** 当前节点的统计上下文（仅实时决策模式且预览完成时存在） */
+function statCtxOf(h, street, t) {
+  if (!t || t.mode !== 'live') return null;
   const key = liveReqKey(h, street);
-  const body = liveBodyHtml(h, street);
+  if (!(livePreview.status === 'done' && livePreview.result && livePreview.key === key)) return null;
+  const acts = displayActs(livePreview.result);
+  return {
+    lookup: statLookup(acts),
+    maxF: Math.max(0.0001, ...acts.map(a => a.freq)),
+    bestEV: Math.max(0, ...acts.map(a => a.ev))
+  };
+}
+function acStatHtml(st, maxF, bestEV) {
+  if (!st) return '';
+  const w = Math.max(4, Math.round((st.freq / (maxF || 1)) * 100));
+  const best = st.ev >= bestEV - 1e-9;
+  return `<span class="ac-stat ${best ? 'best' : ''}">
+    <span class="ac-bar"><i style="width:${w}%"></i></span>
+    <span class="ac-freq">${(st.freq * 100).toFixed(0)}%</span>
+    <span class="ac-ev ${pnlCls(st.ev)}">${st.ev >= 0 ? '+' : ''}${fmt(st.ev)}</span>
+    ${best ? '<span class="ac-rec">推荐</span>' : ''}
+  </span>`;
+}
+/** 求解完成后把统计条补挂到已渲染的选项按钮上（不重建 DOM，避免打断输入焦点与滚动） */
+function applyStatsToCards() {
+  const grid = $('#decisionCards');
+  if (!grid) return;
+  const h = wizard && wizard.hand, street = h && actStreet(h);
+  if (!h) return;
+  const ctx = statCtxOf(h, street, liveTarget(h, street));
+  if (!ctx) return;
+  grid.querySelectorAll('[data-act="quickAction"]').forEach(btn => {
+    if (btn.querySelector('.ac-stat')) return;
+    const type = btn.dataset.v;
+    const amt = btn.dataset.amt != null && btn.dataset.amt !== 'custom' ? Number(btn.dataset.amt) : NaN;
+    let st = null;
+    if (type === 'BET') st = pickStat(ctx.lookup.BET, amt);
+    else if (type === 'RAISE_TO') st = pickStat(ctx.lookup.RAISE, amt);
+    else if (type === 'CALL') st = ctx.lookup.CALL;
+    else if (type === 'ALLIN') st = ctx.lookup.ALLIN;
+    else if (type === 'FOLD') st = ctx.lookup.FOLD;
+    else if (type === 'CHECK') st = ctx.lookup.CHECK;
+    if (st) btn.insertAdjacentHTML('beforeend', acStatHtml(st, ctx.maxF, ctx.bestEV));
+  });
+}
+/** 决策面板：节点信息 + 状态/推荐解释 + 可点击选项（频率/EV 内联）合为一体 */
+function decisionPanelHtml(h, street, live, toCall, flow) {
+  const key = liveReqKey(h, street);
+  const t = liveTarget(h, street);
   const badge = liveBadgeHtml(key);
-  return `<div class="card live-card"><div class="card-title"><h2>实时策略预览</h2>
+  const closed = flow.closed && !ui.act.force;
+  const actor = closed ? null : (nextActorFor(h, street) || flow.first);
+  const actorName = actor ? (actorKey(h, actor) === 'HERO' ? 'Hero' : actorKey(h, actor) === 'VILLAIN' ? '对手' : String(actor)) : '—';
+  const nodeLine = `${STREET_NAME[street] || street} · 底池 ${fmt(live.pot, 1)} BB · ${toCall > 0 ? `面对下注 ${fmt(toCall, 1)} BB` : '无人下注'}${actor ? ` · 轮到 ${esc(actorName)}` : ''}`;
+  const modeTag = t.mode === 'review'
+    ? `<span class="live-tag review">复盘 #${t.di + 1} · 当时局面</span>`
+    : t.mode === 'waiting'
+      ? `<span class="live-tag">等对手行动</span>`
+      : t.mode === 'live' ? `<span class="live-tag">实时决策</span>` : '';
+  const cards = closed
+    ? streetDoneHtml(h, street, flow)
+    : actionCardsHtml(h, live, toCall, street, flow, statCtxOf(h, street, t));
+  return `<div class="card live-card decision-panel">
+    <div class="card-title"><h2>决策面板</h2>
     <span class="live-badge ${badge.cls}" id="liveBadge">${badge.text}</span></div>
-    <div class="live-body" id="liveBodyWrap">${body}</div>
+    <div class="dp-node">${nodeLine} ${modeTag}</div>
+    <div class="live-body" id="liveBodyWrap">${liveBodyHtml(h, street)}</div>
+    ${t.mode === 'review' && !closed ? '<div class="dp-sub">录入当前行动（不影响上方复盘）</div>' : ''}
+    <div class="dp-cards">${cards}</div>
     <div class="tiny muted" style="margin-top:6px">随每次选择即时重算（低迭代快解，仅用于交互反馈；正式结果以「开始解算」为准）。数据只读取当前录入内容，不写入也不覆盖已有数据。</div>
   </div>`;
 }
@@ -729,6 +821,7 @@ function updateLiveBody() {
     badge.className = 'live-badge ' + b.cls;
     badge.textContent = b.text;
   }
+  applyStatsToCards();
 }
 /** 停止实时预览（进入正式求解 / 离开向导时调用），不触碰持久化数据 */
 function stopLivePreview() {
@@ -738,17 +831,18 @@ function stopLivePreview() {
 }
 
 /* ---------- 行动卡片 ---------- */
-function simpleActionCard(type, title, sub, dis, reason) {
-  return `<button class="ac ac-${type.toLowerCase()}" ${dis ? 'disabled' : `data-act="quickAction" data-v="${type}"`}>
+function simpleActionCard(type, title, sub, dis, reason, statHtml = '', amt = null) {
+  return `<button class="ac ac-${type.toLowerCase()}" ${dis ? 'disabled' : `data-act="quickAction" data-v="${type}"${amt != null ? ` data-amt="${amt}"` : ''}`}>
     <span class="ac-ic">${ACTION_ICON[type]}</span>
     <span class="ac-main"><b>${esc(title)}</b><span class="ac-sub">${dis ? '✕ ' + esc(reason) : esc(sub)}</span></span>
+    ${statHtml || ''}
   </button>`;
 }
-function sizeActionCard(type, title, sub, opts, dis, reason) {
+function sizeActionCard(type, title, sub, opts, dis, reason, statFn = null) {
   if (dis) return simpleActionCard(type, title, '', true, reason);
   return `<div class="ac ac-size ac-${type.toLowerCase()}">
     <div class="ac-main"><b>${esc(title)}</b><span class="ac-sub">${esc(sub)}</span></div>
-    <div class="ac-sizes">${opts.map(o => `<button class="sz" data-act="quickAction" data-v="${type}" data-amt="${o.amt}"><b>${fmt(o.amt, 1)}<i>BB</i></b><em>${o.label}</em></button>`).join('')}
+    <div class="ac-sizes">${opts.map(o => `<button class="sz" data-act="quickAction" data-v="${type}" data-amt="${o.amt}"><b>${fmt(o.amt, 1)}<i>BB</i></b><em>${o.label}</em>${statFn ? statFn(type, o.amt) : ''}</button>`).join('')}
       <button class="sz sz-custom" data-act="quickAction" data-v="${type}" data-amt="custom"><b>自定义</b></button></div>
   </div>`;
 }
@@ -771,13 +865,25 @@ function streetDoneHtml(h, street, flow) {
  *  - 无人下注（toCall=0）：过牌 / 下注 / 全下 —— 无「跟注」「加注」，可免费过牌时不提供「弃牌」
  * 尺度选项按当前局面计算，以具体 BB（加注至 X BB / 下注 X BB）展示。
  */
-function actionCardsHtml(h, live, toCall, street, flow) {
+function actionCardsHtml(h, live, toCall, street, flow, statCtx = null) {
   if (flow.closed && !ui.act.force) return streetDoneHtml(h, street, flow);
-  const stack = Math.max(0, Number(h.stackBB) || 100);
+  // 有效后手口径（V1.10）：用行动者真实剩余后手，而不是买入总额（后街全下 / 跟注金额必须落在后手以内）
+  const eff = deriveState(h, (h.actions || []).length);
+  const actor = nextActorFor(h, street) || flow.first;
+  const aKey = actorKey(h, actor);
+  const aSide = aKey === 'HERO' ? 'hero' : aKey === 'VILLAIN' ? 'villain' : null;
+  const ownRem = Math.max(0, aSide && eff.rem ? (eff.rem[aSide] || 0) : (Number(eff.stack) || 0));
+  const streetCur = aSide && eff.streetInv ? (eff.streetInv[aSide] || 0) : 0;
+  const allinTo = Math.round((streetCur + ownRem) * 10) / 10; // ALLIN 的本街总投入目标
   const pot = Math.max(0.5, Number(live.pot) || 1);
   const facing = toCall > 0;
   const preflop = street === 'PREFLOP';
-  const callAmt = Math.min(toCall, stack);
+  const callAmt = Math.round(Math.min(toCall, ownRem) * 10) / 10;
+  const callAllin = ownRem > 0.5 && callAmt >= ownRem - 0.05;
+  const stat = (type, amt) => statCtx ? acStatHtml(
+    type === 'BET' ? pickStat(statCtx.lookup.BET, amt) :
+    type === 'RAISE_TO' ? pickStat(statCtx.lookup.RAISE, amt) :
+    statCtx.lookup[type] || null, statCtx.maxF, statCtx.bestEV) : '';
   const out = [], notes = [];
   if (preflop && facing) {
     // 翻前面对大盲 / 加注，规则上不存在过牌；只有大盲期权（待跟注额为 0）时才出现
@@ -785,22 +891,29 @@ function actionCardsHtml(h, live, toCall, street, flow) {
   }
   if (facing) {
     notes.push(`面对下注 / 加注：不提供「过牌」「下注」；加注按当前局面计算，以「加注至 X BB」展示具体尺度。`);
-    out.push(simpleActionCard('FOLD', '弃牌', '放弃本手，已投入的筹码不收回', false, ''));
-    out.push(simpleActionCard('CALL', `跟注 ${fmt(callAmt, 1)}`, `投入 ${fmt(callAmt, 1)} BB 匹配对手下注`, false, ''));
+    out.push(simpleActionCard('FOLD', '弃牌', '放弃本手，已投入的筹码不收回', false, '', stat('FOLD')));
+    out.push(simpleActionCard('CALL', `跟注 ${fmt(callAmt, 1)}${callAllin ? '（全下）' : ''}`,
+      `投入 ${fmt(callAmt, 1)} BB 匹配对手下注${callAllin ? ' · 后手全部押入' : ''}`, ownRem <= 0.05, '后手不足', stat('CALL'), callAmt));
     const minTo = Math.max(0, Number(live.highest) || 0) + Math.max(1, Number(live.lastRaise) || 1);
-    out.push(sizeActionCard('RAISE_TO', '加注至', `面对 ${fmt(Number(live.highest) || 0, 1)} BB · 最小加注至 ${fmt(minTo, 1)} BB`, raiseSizes(live, stack), false, ''));
+    // 加注仅在有合法加注空间时提供：对手已全下 / 后手不足以最小加注时，只剩弃牌与跟注
+    const canRaise = ownRem > toCall + 0.5 && allinTo + 1e-6 >= minTo;
+    if (canRaise) out.push(sizeActionCard('RAISE_TO', '加注至', `面对 ${fmt(Number(live.highest) || 0, 1)} BB · 最小加注至 ${fmt(minTo, 1)} BB`, raiseSizes(live, allinTo), false, '', stat));
+    else notes.push('对手已全下或你的后手不足以最小加注：当前只有「弃牌 / 跟注」两个选项。');
   } else {
     notes.push('无人下注：不提供「跟注 / 加注」；可免费过牌时「弃牌」无意义，也不提供。');
     const bbOption = preflop && (h.actions || []).some(a => String(a.street).toUpperCase() === 'PREFLOP' && a.type === 'CALL');
     out.push(simpleActionCard('CHECK', bbOption ? '过牌（大盲期权）' : '过牌',
-      bbOption ? '无人再加注，保留大盲期权直接看翻牌' : '不投入，把行动权交给对手', false, ''));
+      bbOption ? '无人再加注，保留大盲期权直接看翻牌' : '不投入，把行动权交给对手', false, '', stat('CHECK')));
     const betTitle = preflop ? '加注（大盲期权）' : '下注';
     out.push(sizeActionCard('BET', betTitle,
       preflop ? `主动加注 · 底池 ${fmt(pot, 1)} BB，按比例给出加注额` : `主动下注 · 底池 ${fmt(pot, 1)} BB`,
-      betSizes(live, stack), false, ''));
+      betSizes(live, ownRem), ownRem <= 0.5, '后手不足', stat));
   }
-  out.push(simpleActionCard('ALLIN', `全下 ${fmt(stack, 1)}`, `投入全部后手 ${fmt(stack, 1)} BB`, stack <= 0.5, '后手不足'));
-  return `<div class="ac-grid">${out.join('')}</div>
+  if (ownRem > 0.5 && (!facing || ownRem > toCall + 0.5)) {
+    out.push(simpleActionCard('ALLIN', `全下 ${fmt(allinTo, 1)}`,
+      `投入全部后手 ${fmt(ownRem, 1)} BB（本街总投入 ${fmt(allinTo, 1)} BB）`, false, '', stat('ALLIN'), allinTo));
+  }
+  return `<div class="ac-grid" id="decisionCards">${out.join('')}</div>
     ${notes.map(n => `<div class="ac-note">${esc(n)}</div>`).join('')}
     ${ui.act.force ? `<div class="notice" style="margin-top:8px">手动补录模式：当前行动者 <b>${esc(nextActorFor(h, street) || '—')}</b>。
       <button class="btn sm" data-act="cancelForce">恢复自动顺位</button></div>` : ''}`;
@@ -903,8 +1016,7 @@ function wizardStep2(h, di, v, rd) {
       ${ui.act.actor ? '<button class="btn sm" data-act="resetActor">自动顺位</button>' : ''}
     </div>
     ${tableHtml(h, street, actor, live)}
-    ${liveSolvePanelHtml(h, street)}
-    ${actionCardsHtml(h, live, toCall, street, flow)}
+    ${decisionPanelHtml(h, street, live, toCall, flow)}
     ${closed ? '' : `<details class="adv-amt"><summary>自定义金额（可选）</summary>
       <div class="row" style="margin-top:6px"><input type="number" id="naAmount" step="0.1" min="0" placeholder="输入 BB 数，然后点上方「自定义」">
       <span class="tiny muted">用于「下注 / 加注」的「自定义」按钮；留空则采用卡片上的建议值。</span></div>
@@ -1515,7 +1627,9 @@ function handleAct(act, ds, ev) {
       if (flow.closed && !ui.act.force) { toast('本街行动已结束：请进入下一街，或点「仍要在本街补录」'); break; }
       const actor = nextActorFor(h, street) || flow.first;
       const { live } = liveFor(h, street);
-      const sug = suggestedAmounts(h, live);
+      const effState = deriveState(h, (h.actions || []).length);
+      const sugSide = actorKey(h, actor) === 'HERO' ? 'hero' : actorKey(h, actor) === 'VILLAIN' ? 'villain' : null;
+      const sug = suggestedAmounts(h, live, effState, sugSide);
       let amountBB = sug[v];
       if (ds.amt === 'custom') {
         const raw = $('#naAmount')?.value ?? '';

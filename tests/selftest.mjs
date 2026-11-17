@@ -498,5 +498,48 @@ console.log('\n[11] V1.9 行动标签口径：具体 BB 尺度 / 加注至语义
   ok('下注标签不含百分比旧说法', rc.actions.every(a => !String(a.label).includes('% 池')));
 }
 
+console.log('\n[12] V1.10 超后手钳制：「跟注 0 BB」退化回归（用户牌谱）');
+{
+  const HH = `# PokerGTO HH v1
+Game: NLHE
+Stakes: SB=1 BB=2
+Table: 6max
+Hero: BB [Kc4c]
+Stacks: Hero=100 Villain=100 (BB)
+Preflop:  BTN raise 6.0, BB raise 24.0, BTN call 18.0
+Flop: [QdTd3h]  BB bet 33.2, BTN call 33.2
+Turn: [QdTd3h5s]  BB check, BTN bet 58.0`;
+  const { hand } = parseHH(HH);
+  const v = validateHand(hand);
+  ok('超后手行动给出警告且不判错（按全下钳制）', v.ok && v.warnings.some(w => /超过剩余后手 42\.8/.test(w)), JSON.stringify(v.warnings));
+  ok('钳制后待跟注额 = 42.8（对手全下）', Math.abs(v.live.toCall - 42.8) < 0.05, String(v.live.toCall));
+  const pend = pendingHeroDecision(hand);
+  ok('待应对决策点 toCall = 42.8', !!pend && Math.abs(pend.toCall - 42.8) < 0.05, JSON.stringify(pend));
+  const st = deriveState(hand, pend.index);
+  ok('deriveState 有效后手 = 42.8（不再归零）', Math.abs(st.stack - 42.8) < 0.05, String(st.stack));
+  ok('deriveState facingBet = 42.8（钳制到后手以内）', Math.abs(st.facingBet - 42.8) < 0.05, String(st.facingBet));
+  ok('剩余后手字段：hero 42.8 / villain 0', Math.abs(st.rem.hero - 42.8) < 0.05 && st.rem.villain < 0.05, JSON.stringify(st.rem));
+  const r = solveCore({
+    board: st.board, heroCards: hand.heroCards, villainCards: hand.villainCards, deadCards: [],
+    heroRange: hand.ranges.hero, villainRange: hand.ranges.villain,
+    pot: st.pot, stack: st.stack, facingBet: st.facingBet, heroOOP: st.heroOOP, oppChecked: st.oppChecked,
+    sizes: hand.sizes, allowCheckRaise: hand.allowCheckRaise, preset: 'fast',
+    mode: 'gto', archetype: null, intensity: 0.5, userAction: null,
+    decisionNode: 'TURN|BB|vs_bet', decisionIndex: pend.index, stage: 'TURN'
+  }, () => {});
+  ok('根行动不含「跟注 0」退化标签', r.actions.every(a => !/^跟注 0(\.0)? BB/.test(a.label)), r.actions.map(a => a.label).join(' | '));
+  const call = r.actions.find(a => a.type === 'CALL');
+  ok('跟注标签为「跟注 42.8 BB（全下）」', !!call && call.label === '跟注 42.8 BB（全下）', call && call.label);
+  ok('跟注金额 = 42.8 且面对全下无加注选项', !!call && Math.abs(call.sizeBB - 42.8) < 0.05 && !r.actions.some(a => a.type === 'RAISE' || a.type === 'BET'), JSON.stringify(r.actions.map(a => a.type)));
+  ok('存在弃牌选项（非 100% 跟注单一退化解）', r.actions.some(a => a.type === 'FOLD') && call.freq < 0.999, 'call freq=' + (call && call.freq));
+  // 退化输入防御：facingBet 超过 stack 时 makeRoot 钳制，不产生「跟注 0 BB」
+  const r2 = solveCore(makeReq({ facingBet: 58, stack: 0, pot: 158.7, iterations: 40 }), () => {});
+  ok('退化输入（stack=0, facing=58）仍无「跟注 0」', r2.actions.every(a => !/^跟注 0(\.0)? BB/.test(a.label)), r2.actions.map(a => a.label).join(' | '));
+  // 正常局面不受影响：跟注标签无（全下）后缀
+  const r3 = solveCore(makeReq({ facingBet: 9, iterations: 40 }), () => {});
+  const c3 = r3.actions.find(a => a.type === 'CALL');
+  ok('正常跟注无全下后缀', !!c3 && /^跟注 9\.0 BB$/.test(c3.label), c3 && c3.label);
+}
+
 console.log(`\n结果：${pass} 通过 / ${fail} 失败\n`);
 if (fail) process.exit(1);

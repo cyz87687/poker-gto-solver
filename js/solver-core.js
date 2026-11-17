@@ -50,11 +50,14 @@ function redistribute(s, idx, target) {
 
 /* ---------------- 街内博弈树 ---------------- */
 function makeRoot(req) {
+  const stack = Math.max(0, req.stack);
+  // 面对下注钳制到有效后手以内（对手下注多于短码后手时等价于短码全下），杜绝「跟注 0 BB」退化
+  const facing = Math.min(Math.max(0, req.facingBet), stack);
   return {
-    key: '', pot: Math.max(0.1, req.pot), hInv: 0, vInv: Math.max(0, req.facingBet),
-    toCall: Math.max(0, req.facingBet), toAct: 'hero', raises: req.facingBet > 0 ? 1 : 0,
+    key: '', pot: Math.max(0.1, req.pot), hInv: 0, vInv: facing,
+    toCall: facing, toAct: 'hero', raises: facing > 0 ? 1 : 0,
     checked: { hero: false, villain: !!req.oppChecked }, afterCheck: false,
-    allin: false, terminal: null, stack: Math.max(1, req.stack)
+    allin: false, terminal: null, stack: Math.max(1, stack)
   };
 }
 function inv(s, p) { return p === 'hero' ? s.hInv : s.vInv; }
@@ -72,20 +75,26 @@ function actionList(s, ctx) {
   };
   const acts = [];
   const rem = Math.min(remFor(s, 'hero'), remFor(s, 'villain'));
+  // 跟注额按「行动者自己的剩余后手」封顶：对手全下 / 下注超过短码后手时，跟注=自己的全部后手，而不是 0
+  const actorRem = remFor(s, s.toAct);
+  const toCallEff = Math.min(s.toCall, actorRem);
+  const callLabel = amt => {
+    const a = (Math.round(amt * 10) / 10).toFixed(1);
+    const isAllin = actorRem > 1e-6 && amt >= actorRem - 1e-6;
+    return `跟注 ${a} BB${isAllin ? '（全下）' : ''}`;
+  };
   const A = t => acts.push(t);
   if (s.allin) {
-    if (s.toCall > 0) {
-      const callAmt = Math.min(s.toCall, rem);
+    if (toCallEff > 1e-6) {
       A({ type: 'FOLD', key: 'F', label: '弃牌' });
-      A({ type: 'CALL', amount: callAmt, key: 'C', label: `跟注 ${(Math.round(callAmt * 10) / 10).toFixed(1)} BB` });
+      A({ type: 'CALL', amount: toCallEff, key: 'C', label: callLabel(toCallEff) });
     }
     else A({ type: 'CHECK', key: 'X', label: '过牌' });
     return finish(acts);
   }
-  if (s.toCall > 0) {
+  if (toCallEff > 1e-6) {
     A({ type: 'FOLD', key: 'F', label: '弃牌' });
-    const callAmt = Math.min(s.toCall, rem);
-    A({ type: 'CALL', amount: callAmt, key: 'C', label: `跟注 ${(Math.round(callAmt * 10) / 10).toFixed(1)} BB` });
+    A({ type: 'CALL', amount: toCallEff, key: 'C', label: callLabel(toCallEff) });
     const canRaise = s.raises < ctx.maxRaises && !(ctx.checkRaise === false && s.afterCheck);
     if (canRaise && rem > s.toCall + 0.5) {
       const pool = s.pot + s.toCall;

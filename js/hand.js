@@ -259,6 +259,7 @@ export function validateHand(hand) {
 
   let pot = blindsBB;
   const invest = new Map(); // 行动者(归一后) -> 本街累计投入
+  const totalMap = new Map(); // 行动者(归一后) -> 跨街累计投入（后手钳制用，换街不清零）
   let toCall = 1; // 大盲 1BB 视作待跟注额（翻前）
   let lastRaise = 1;
   let streetSeen = -1;
@@ -308,6 +309,19 @@ export function validateHand(hand) {
     const amt = a.amountBB == null ? null : Number(a.amountBB);
     if (amt != null && (!Number.isFinite(amt) || amt < 0)) errors.push({ path, msg: '下注量必须为非负数值' });
     const maxInvest = stack;
+    // 跨街累计后手钳制（V1.10）：累计投入不得超过买入；超出部分按「全下剩余后手」计算并警告，
+    // 修复「下注超过后手 → 有效后手归零 → 均衡动作显示跟注 0 BB」的退化错误
+    const prevTotal = totalMap.get(actor) || 0;
+    const remain = Math.max(0, maxInvest - prevTotal);
+    const applyPay = rawPay => {
+      let pay = Math.max(0, rawPay);
+      if (pay > remain + 1e-6) {
+        warnings.push(`第 ${idx + 1} 条：${a.actor} ${a.type} ${pay.toFixed(1)} BB 超过剩余后手 ${remain.toFixed(1)} BB，已按全下 ${remain.toFixed(1)} BB 处理`);
+        pay = remain;
+      }
+      pot += pay; invest.set(actor, cur + pay); totalMap.set(actor, prevTotal + pay);
+      return pay;
+    };
     switch (a.type) {
       case 'CHECK':
         if (toCall > 0) errors.push({ path, msg: '有待跟注额时不能过牌' });
@@ -316,17 +330,20 @@ export function validateHand(hand) {
         if (toCall <= 0) warnings.push(`第 ${idx + 1} 条：无待跟注额却弃牌（已按合法归档处理）`);
         break;
       case 'CALL': {
-        const pay = amt != null ? amt : toCall;
+        const pay = applyPay(amt != null ? amt : toCall);
         if (toCall <= 0) errors.push({ path, msg: '无待跟注额时不能跟注' });
         if (amt != null && Math.abs(amt - toCall) > 0.6) warnings.push(`第 ${idx + 1} 条：跟注额 ${amt} 与待跟注额 ${toCall.toFixed(1)} 不一致`);
-        pot += pay; invest.set(actor, cur + pay); toCall = 0;
+        toCall = 0;
         break;
       }
       case 'BET': {
         if (toCall > 0) errors.push({ path, msg: '有待跟注额时应使用 RAISE_TO，不能 BET' });
         if (amt == null) errors.push({ path, msg: 'BET 缺少下注量' });
         else if (amt < 1 - 1e-6) errors.push({ path, msg: `下注 ${amt} BB 低于最小下注 1 BB` });
-        else { pot += amt; invest.set(actor, cur + amt); toCall = amt; lastRaise = amt; }
+        else {
+          const pay = applyPay(amt);
+          toCall = pay; lastRaise = Math.max(1e-6, pay);
+        }
         break;
       }
       case 'RAISE_TO': {
@@ -335,19 +352,20 @@ export function validateHand(hand) {
         if (toCall <= 0) errors.push({ path, msg: '无待跟注额时不能加注' });
         if (amt == null) errors.push({ path, msg: 'RAISE_TO 缺少目标额' });
         else if (amt + 1e-6 < minTo) errors.push({ path, msg: `加注至 ${amt} BB 低于最小加注额 ${minTo.toFixed(1)} BB` });
-        else { const inc = Math.max(0, amt - cur); pot += inc; invest.set(actor, amt); toCall = Math.max(0, amt - highest); lastRaise = toCall; }
+        else {
+          const pay = applyPay(Math.max(0, amt - cur));
+          toCall = Math.max(0, (cur + pay) - highest); lastRaise = toCall;
+        }
         break;
       }
       case 'ALLIN': {
         const target = amt != null ? amt : Math.max(cur + toCall, maxInvest);
-        if (target > maxInvest + 1e-6) errors.push({ path, msg: `全下 ${target} BB 超过有效后手 ${maxInvest} BB` });
-        const inc = Math.max(0, target - cur);
-        pot += inc; invest.set(actor, target); toCall = Math.max(0, target - Math.max(0, ...[...invest.entries()].filter(([k]) => k !== actor).map(([, v]) => v)));
+        const pay = applyPay(Math.max(0, target - cur));
+        toCall = Math.max(0, (cur + pay) - Math.max(0, ...[...invest.entries()].filter(([k]) => k !== actor).map(([, v]) => v)));
         lastRaise = toCall; allInSides.add(actorSide(hand, actor));
         break;
       }
     }
-    for (const [k, v] of invest) if (v > maxInvest + 1e-6) errors.push({ path, msg: `${k} 累计投入 ${v.toFixed(1)} BB 超过有效后手 ${maxInvest} BB` });
     // 下注轮收口判定：弃牌收尾 / 未出局者全部全下 / 全员已行动且无待跟注
     participants.add(actor);
     if (a.type === 'FOLD') foldedSet.add(actor);
@@ -581,6 +599,7 @@ export function normalizeActionAmounts(actions, hand) {
   const r1 = x => Math.round(x * 10) / 10;
   let pot = sb / bb + 1, toCall = 1, lastRaise = 1, streetSeen = -1;
   const invest = new Map();
+  const totalMap = new Map(); // 跨街累计（钳制重放用）
   return (actions || []).map(raw => {
     const a = { ...raw, street: String(raw.street || '').toUpperCase(), actor: String(raw.actor || '').toUpperCase() };
     const si = STREETS.indexOf(a.street);
@@ -594,11 +613,19 @@ export function normalizeActionAmounts(actions, hand) {
       else if (a.type === 'ALLIN') a.amountBB = r1(stack);
     }
     const amt = a.amountBB == null ? null : Number(a.amountBB);
+    // 重放钳制（不改写用户金额）：累计投入不超过买入，超出按剩余后手参与后续推算
+    const prevTotal = totalMap.get(a.actor) || 0;
+    const remain = Math.max(0, stack - prevTotal);
+    const spend = rawPay => {
+      const pay = Math.max(0, Math.min(rawPay, remain));
+      pot += pay; invest.set(a.actor, cur + pay); totalMap.set(a.actor, prevTotal + pay);
+      return pay;
+    };
     if (a.type === 'CHECK') { /* 无投入变化 */ }
-    else if (a.type === 'CALL') { const pay = amt != null ? amt : toCall; pot += pay; invest.set(a.actor, cur + pay); toCall = 0; }
-    else if (a.type === 'BET' && amt != null) { pot += amt; invest.set(a.actor, cur + amt); toCall = amt; lastRaise = amt; }
-    else if (a.type === 'RAISE_TO' && amt != null) { pot += Math.max(0, amt - cur); invest.set(a.actor, amt); toCall = Math.max(0, amt - highest); lastRaise = toCall; }
-    else if (a.type === 'ALLIN' && amt != null) { const target = Math.min(amt, stack); pot += Math.max(0, target - cur); invest.set(a.actor, target); toCall = Math.max(0, target - Math.max(0, ...[...invest.entries()].filter(([k]) => k !== a.actor).map(([, val]) => val))); lastRaise = toCall; }
+    else if (a.type === 'CALL') { spend(amt != null ? amt : toCall); toCall = 0; }
+    else if (a.type === 'BET' && amt != null) { const pay = spend(amt); toCall = pay; lastRaise = Math.max(1e-6, pay); }
+    else if (a.type === 'RAISE_TO' && amt != null) { spend(Math.max(0, amt - cur)); toCall = Math.max(0, Math.min(amt, cur + remain) - highest); lastRaise = toCall; }
+    else if (a.type === 'ALLIN' && amt != null) { const target = Math.min(amt, stack); spend(Math.max(0, target - cur)); toCall = Math.max(0, Math.min(target, cur + remain) - Math.max(0, ...[...invest.entries()].filter(([k]) => k !== a.actor).map(([, val]) => val))); lastRaise = toCall; }
     return a;
   });
 }
@@ -609,6 +636,8 @@ export function deriveState(hand, decisionIndex) {
   let pot = (sb / bb) + 1;
   const invest = new Map();
   const totalInvest = { hero: 0, villain: 0, other: 0 };
+  let streetInv = { hero: 0, villain: 0, other: 0 };
+  const stackBB = num(hand.stackBB) || 0;
   let toCall = 1, lastRaise = 1, streetSeen = -1, lastAggSide = null, lastStreet = 'PREFLOP';
   const actions = hand.actions || [];
   const n = Math.max(0, Math.min(decisionIndex, actions.length));
@@ -616,7 +645,10 @@ export function deriveState(hand, decisionIndex) {
     const a = actions[i];
     const st = String(a.street).toUpperCase();
     const si = STREETS.indexOf(st);
-    if (si > streetSeen) { streetSeen = si; invest.clear(); toCall = si === 0 ? 1 : 0; lastRaise = 1; lastAggSide = null; }
+    if (si > streetSeen) {
+      streetSeen = si; invest.clear(); toCall = si === 0 ? 1 : 0; lastRaise = 1; lastAggSide = null;
+      streetInv = { hero: 0, villain: 0, other: 0 };
+    }
     lastStreet = st;
     const side = actorSide(hand, a.actor);
     const actor = String(a.actor).toUpperCase();
@@ -627,7 +659,11 @@ export function deriveState(hand, decisionIndex) {
     else if (a.type === 'BET') pay = amt || 0;
     else if (a.type === 'RAISE_TO') pay = amt != null ? Math.max(0, amt - cur) : toCall;
     else if (a.type === 'ALLIN') pay = amt != null ? Math.max(0, amt - cur) : Math.max(0, toCall);
-    pot += pay; invest.set(actor, cur + pay); totalInvest[side] += pay;
+    // 跨街累计后手钳制（V1.10）：任何人的累计投入不得超过买入；超出部分按「全下后手」计算，
+    // 避免「对手下注超过后手 → 有效后手被扣成 0 → 均衡动作显示跟注 0 BB」的退化错误
+    const remain = Math.max(0, stackBB - totalInvest[side]);
+    if (pay > remain + 1e-6) pay = remain;
+    pot += pay; invest.set(actor, cur + pay); totalInvest[side] += pay; streetInv[side] += pay;
     if (a.type === 'BET' || a.type === 'RAISE_TO' || a.type === 'ALLIN') {
       const highest = Math.max(0, ...[...invest.entries()].filter(([k]) => k !== actor).map(([, v]) => v));
       toCall = Math.max(0, (cur + pay) - highest);
@@ -637,17 +673,22 @@ export function deriveState(hand, decisionIndex) {
   const street = STREETS[Math.max(0, streetSeen)];
   const boardLen = street === 'PREFLOP' ? 0 : street === 'FLOP' ? 3 : street === 'TURN' ? 4 : 5;
   const board = (hand.board || []).slice(0, boardLen);
-  const stack = Math.max(0, (num(hand.stackBB) || 0) - Math.max(totalInvest.hero, totalInvest.villain));
-  const facingBet = street === 'PREFLOP'
+  const remOf = s => Math.max(0, stackBB - totalInvest[s]);
+  const facingRaw = street === 'PREFLOP'
     // 翻前大盲 1BB 视作待跟注额：无主动加注方时仍需跟注，不能过牌
     ? (lastAggSide === 'villain' ? Math.max(0, toCall) : lastAggSide === null ? (toCall > 0 ? toCall : 1) : 0)
     : (lastAggSide === 'villain' ? Math.max(0, toCall) : 0);
+  // 有效决策深度 = min(Hero 剩余后手, 对手街始剩余)；对手「未被回应的下注」不占用其后手
+  const stack = Math.min(remOf('hero'), remOf('villain') + facingRaw);
+  // 面对下注不超过有效后手（对手下注多于短码后手时，等价于短码全下）
+  const facingBet = Math.min(facingRaw, stack);
   const potUse = hand.potBB != null && Number.isFinite(Number(hand.potBB)) ? Number(hand.potBB) : pot;
   const heroOOP = heroIsOOP(hand);
   return {
     street, board, pot: Math.max(0.1, potUse), stack, facingBet,
     heroOOP, oppChecked: !heroOOP && !facingBet,
-    decisionIndex: n, lastStreet, totalInvest
+    decisionIndex: n, lastStreet, totalInvest,
+    rem: { hero: remOf('hero'), villain: remOf('villain') }, streetInv
   };
 }
 export function heroDecisionIndices(hand) {
