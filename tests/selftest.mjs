@@ -14,6 +14,7 @@ import {
   initDB, state, commit, upsertSession, upsertHand, sessionNet, computeStats,
   escapeHtml, exportJSON, importJSON, exportSessionsCSV
 } from '../js/db.js';
+import { rangesForDecision, preflopRaiseLevel, raiseLevelFraction, narrowRangeTop } from '../js/range-by-action.js';
 
 let pass = 0, fail = 0;
 function ok(name, cond, extra = '') {
@@ -570,6 +571,66 @@ console.log('\n[13] 求解尺度与推荐文案同源（V1.11：加注至选项�
   ok('求解档位带来源标签「均衡档」', raises.every(o => o.label === '均衡档') && bets.every(o => o.label === '均衡档'));
   ok('重复金额去重', solverSizeOptions([{ type: 'RAISE', sizeBB: 11.1 }, { type: 'RAISE', sizeBB: 11.1 }], 'RAISE', 42.8, 9.6).length === 1);
   ok('金额四舍五入到 0.1 BB', solverSizeOptions([{ type: 'RAISE', sizeBB: 11.06 }], 'RAISE', 42.8, 9.6)[0].amt === 11.1);
+}
+
+/* [14] V1.12 行动一致范围：对手加注后范围收窄，杜绝深码弱牌被误判全下 */
+{
+  const HH = `# PokerGTO HH v1
+Game: NLHE
+Stakes: SB=1 BB=2
+Table: 6max
+Hero: BTN [3c3d]
+Stacks: Hero=500 Villain=500 (BB)
+Preflop:  BTN raise 3.5, BB raise 14.0, BTN raise 40.0, BB raise 132.0`;
+  const { hand } = parseHH(HH);
+  const idx = pendingHeroDecision(hand).index;
+  ok('牌谱解析无错误且决策点=4', idx === 4, 'idx=' + idx);
+
+  // 加注级别
+  ok('对手翻前再加注级别=2（3bet→5bet）', preflopRaiseLevel(hand, 'villain', idx) === 2);
+  ok('Hero 加注级别=2（open→4bet）', preflopRaiseLevel(hand, 'hero', idx) === 2);
+  const noRaise = { ...hand, actions: [] };
+  ok('无加注时级别=0', preflopRaiseLevel(noRaise, 'villain') === 0);
+  const oneRaise = { ...hand, actions: hand.actions.slice(0, 1) };
+  ok('仅开池时对手级别=0', preflopRaiseLevel(oneRaise, 'villain') === 0);
+
+  // 深码收窄比例
+  const fDeep = raiseLevelFraction(2, 500), fShort = raiseLevelFraction(2, 100);
+  ok('深码收窄比例严格小于短码', fDeep < fShort, `${fDeep} < ${fShort}`);
+  ok('无加注不收窄', raiseLevelFraction(0, 500) === 1);
+  ok('级别越高范围越窄', raiseLevelFraction(1, 100) > raiseLevelFraction(2, 100) && raiseLevelFraction(2, 100) > raiseLevelFraction(3, 100));
+
+  // 纯函数收窄
+  const m = presetMatrix('bb');
+  const nm = narrowRangeTop(m, 0.16);
+  ok('收窄后 AA 保留', nm[12][12] > 0);
+  ok('收窄剔除大量弱牌', nm[6][2] === 0 || nm[0][1] === 0, `72o=${nm[6][2]} 23o=${nm[0][1]}`);
+  ok('收窄不修改原矩阵', m[6][2] > 0 || m[0][1] > 0);
+  ok('fraction=1 原样返回', narrowRangeTop(m, 1) === m);
+
+  // 派生范围不影响已存数据
+  const ranges = rangesForDecision(hand, idx);
+  ok('派生说明含加注级别与比例', /加注级别 2/.test(ranges.note) && /16%/.test(ranges.note), ranges.note);
+  ok('Hero 范围保持原样（手牌已知）', ranges.hero === hand.ranges.hero);
+  ok('对手范围被收窄（组合减少）', matrixToCombos(ranges.villain, [], 0.02, 420).length < matrixToCombos(hand.ranges.villain, [], 0.02, 420).length);
+
+  // 端到端：33 不再 100% 全下
+  const st = deriveState(hand, idx);
+  const req = {
+    board: [], heroCards: hand.heroCards, villainCards: [], deadCards: [],
+    heroRange: ranges.hero, villainRange: ranges.villain,
+    pot: st.pot, stack: st.stack, facingBet: st.facingBet,
+    sizes: hand.sizes, allowCheckRaise: true, preset: 'fast', mode: 'gto', iterations: 12000
+  };
+  const r = solveCore(req);
+  const focus = r.focus.strategy;
+  const rec = focus.slice().sort((a, b) => b.freq - a.freq)[0];
+  const ai = focus.find(a => a.type === 'ALLIN');
+  ok('3c3d 对收窄后范围权益显著下降', r.focus.equityVsVillainRange < 0.4, 'eq=' + r.focus.equityVsVillainRange);
+  ok('3c3d 不再推荐全下', rec.type !== 'ALLIN', rec.label + ' ' + (rec.freq * 100).toFixed(0) + '%');
+  ok('3c3d 全下手牌条件频率 < 20%', ai.freq < 0.2, 'AI=' + (ai.freq * 100).toFixed(1) + '%');
+  ok('3c3d 推荐弃牌（5bet 价值范围下合理）', rec.type === 'FOLD', rec.label);
+  ok('求解结果仍给出全部合法动作', r.actions.length === 5, 'acts=' + r.actions.length);
 }
 
 console.log(`\n结果：${pass} 通过 / ${fail} 失败\n`);

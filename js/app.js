@@ -14,6 +14,7 @@ import {
 import { drawCurve, drawBars, renderHeatmapGrid, buildResultImage } from './charts.js';
 import { solveCore, SOLVE_ITER } from './solver-core.js';
 import { solverSizeOptions } from './ui-sizes.js';
+import { rangesForDecision } from './range-by-action.js';
 
 const $ = s => document.querySelector(s);
 const app = $('#app');
@@ -165,13 +166,15 @@ function buildSolveReq(h, decisionIndex) {
   const stage = (wizard && wizard.stage) || stageFromBoard((h.board || []).length);
   const need = stageBoardCount(stage);
   const board = need === 0 ? [] : (h.board || []).filter(c => c != null).slice(0, need);
+  // 行动一致范围：对手翻前加注后其真实范围远窄于位置预设，按加注级别派生收窄（不写回已存数据）
+  const ranges = rangesForDecision(h, decisionIndex);
   // 决策点所在街与当前阶段不一致时，视为「新街起始局面」：无待跟注额，按位置决定谁先动
   const sameStreet = st.street === stage;
   const facingBet = sameStreet ? st.facingBet : (stage === 'PREFLOP' ? st.facingBet : 0);
   const oppChecked = sameStreet ? st.oppChecked : (stage === 'PREFLOP' ? false : !st.heroOOP);
   return {
     board, heroCards: h.heroCards || [], villainCards: h.villainCards || [], deadCards: h.deadCards || [],
-    heroRange: h.ranges.hero, villainRange: h.ranges.villain,
+    heroRange: ranges.hero, villainRange: ranges.villain, rangeNote: ranges.note,
     pot, stack, facingBet, heroOOP: st.heroOOP, oppChecked,
     sizes: h.sizes, allowCheckRaise: h.allowCheckRaise, preset: h.preset,
     mode: h.mode, archetype: h.archetype, intensity: h.intensity,
@@ -600,6 +603,7 @@ function liveWhyHtml(r, req, actsIn = null) {
     ALLIN: '全下最大化弃牌率，被跟注时实现全部权益'
   };
   if (whyMap[rec.type]) lines.push(`主要判断依据：${whyMap[rec.type]}。`);
+  if (req && req.rangeNote) lines.push(`范围口径：${esc(req.rangeNote)}。`);
   return `<div class="live-why"><div class="why-hd">为什么推荐</div>${lines.map(l => `<div class="why-line">${l}</div>`).join('')}</div>`;
 }
 /** 实时面板主体：waiting/closed/incomplete 直接给出状态说明；live/review 走求解状态机 */

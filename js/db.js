@@ -126,7 +126,7 @@ export function upsertJob(job) {
   });
 }
 /* 求解器版本令牌：迭代口径/预算变更时递增，仅使旧缓存不再命中（旧 job 数据保留不动） */
-const SOLVER_REV = 'v1.8';
+const SOLVER_REV = 'v1.12';
 export function findCachedJob(hand, params) {
   const key = JSON.stringify([hand.id, params.mode, params.archetype, params.intensity, params.sizes, params.pot, params.stack, params.decisionIndex, params.preset, SOLVER_REV]);
   return state().jobs.find(j => j.cacheKey === key && j.status === 'done' && j.result) || null;
