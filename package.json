@@ -7,6 +7,8 @@
   "scripts": {
     "dev": "python3 -m http.server 4173",
     "test": "node tests/selftest.mjs",
-    "check": "node --check js/cards.js && node --check js/hand.js && node --check js/solver-core.js && node --check js/solver.worker.js && node --check js/db.js && node --check js/charts.js && node --check js/app.js"
+    "test:browser": "node tests/browser/run-all.mjs",
+    "test:all": "node tests/selftest.mjs && node tests/browser/run-all.mjs",
+    "check": "node --check js/cards.js && node --check js/hand.js && node --check js/solver-core.js && node --check js/solver.worker.js && node --check js/db.js && node --check js/charts.js && node --check js/app.js && node --check js/range-by-action.js && node --check js/archetypes.js && node --check js/ui-sizes.js"
   }
 }

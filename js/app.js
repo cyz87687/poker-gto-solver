@@ -169,8 +169,16 @@ function buildSolveReq(h, decisionIndex) {
   const stage = (wizard && wizard.stage) || stageFromBoard((h.board || []).length);
   const need = stageBoardCount(stage);
   const board = need === 0 ? [] : (h.board || []).filter(c => c != null).slice(0, need);
-  // 行动一致范围：对手翻前加注后其真实范围远窄于位置预设，按加注级别派生收窄（不写回已存数据）
-  const ranges = rangesForDecision(h, decisionIndex);
+  // 行动一致范围（V1.15 绝对宽度口径）：对手翻前再加注后其真实范围远窄于位置预设，
+  // 宽度由「位置对 × 画像风格 × 结构修正」共同决定（不写回已存数据）
+  const effStack = Math.min(
+    Number.isFinite(Number(st.rem?.hero)) ? Number(st.rem.hero) : Infinity,
+    Number.isFinite(Number(st.rem?.villain)) ? Number(st.rem.villain) : Infinity
+  );
+  const ranges = rangesForDecision(h, decisionIndex, {
+    mode: h.mode, archetype: h.archetype, intensity: h.intensity,
+    stackBB: Number.isFinite(effStack) ? effStack : st.stack
+  });
   // 决策点所在街与当前阶段不一致时，视为「新街起始局面」：无待跟注额，按位置决定谁先动
   const sameStreet = st.street === stage;
   const facingBet = sameStreet ? st.facingBet : (stage === 'PREFLOP' ? st.facingBet : 0);
@@ -179,6 +187,9 @@ function buildSolveReq(h, decisionIndex) {
     board, heroCards: h.heroCards || [], villainCards: h.villainCards || [], deadCards: h.deadCards || [],
     heroRange: ranges.hero, villainRange: ranges.villain, rangeNote: ranges.note,
     villainRangeLocked: ranges.villainLevel > 0,
+    // 宽度已在派生层算好，求解器不再二次调整（否则松型画像会重复放大）
+    villainRangePreNarrowed: ranges.widthInfo != null,
+    rangeWidthInfo: ranges.widthInfo,
     pot, stack, facingBet, heroOOP: st.heroOOP, oppChecked,
     sizes: h.sizes, allowCheckRaise: h.allowCheckRaise, preset: h.preset,
     mode: h.mode, archetype: h.archetype, intensity: h.intensity,

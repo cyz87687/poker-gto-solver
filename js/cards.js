@@ -204,8 +204,9 @@ export function deckExcluding(used) {
 function drawCards(pool, n, rng) {
   const out = [];
   for (let k = 0; k < n && pool.length; k++) {
-    const i = Math.floor(rng() * pool.length);
-    out.push(pool[i]); pool.splice(i, 1);
+    const i = k + Math.floor(rng() * (pool.length - k));
+    const t = pool[k]; pool[k] = pool[i]; pool[i] = t;
+    out.push(pool[k]);
   }
   return out;
 }
@@ -217,7 +218,10 @@ function pickWeighted(combos, rng) {
   for (const c of combos) { x -= c[2]; if (x <= 0) return c; }
   return combos[combos.length - 1];
 }
-/** 单一组合对范围的摊牌权益（0..1）；未发完的公共牌用蒙特卡洛 runout 采样 */
+/** 单一组合对范围的摊牌权益（0..1）；未发完的公共牌用蒙特卡洛 runout 采样
+ *  V1.15 性能与精度：牌堆一次构建 + 部分洗牌（原实现每采样一次重建 52 张牌堆并分配数组），
+ *  对手组合改用累积权重二分抽样，避免每次遍历整个范围求权重和。
+ *  抽样分布与原实现等价，但把翻前权益的采样数从 96 提到 256 成为可承受的代价。 */
 export function comboEquityVsRange(combo, villainCombos, board, samples, rng) {
   const blocked = new Set([...combo, ...board]);
   const vc = villainCombos.filter(c => !blocked.has(c[0]) && !blocked.has(c[1]));
@@ -230,11 +234,31 @@ export function comboEquityVsRange(combo, villainCombos, board, samples, rng) {
     for (const v of vc) { const vs = eval7([...v.slice(0, 2), ...board]); eq += hs > vs ? 1 : hs < vs ? 0 : 0.5; n++; }
   } else {
     const need = 5 - board.length;
+    const pool = deckExcluding([...combo, ...board]);
+    const nPool = pool.length;
+    if (!nPool) return 0.5;
+    const work = pool.slice();
+    const cum = new Float64Array(vc.length);
+    let tot = 0;
+    for (let i = 0; i < vc.length; i++) { tot += vc[i][2]; cum[i] = tot; }
+    const run = new Array(need);
     for (let s = 0; s < samples; s++) {
-      const pool = deckExcluding([...combo, ...board]);
-      const run = drawCards(pool, need, rng);
-      const v = pickWeighted(vc.filter(c => !run.includes(c[0]) && !run.includes(c[1])), rng);
-      if (!v) continue;
+      for (let k = 0; k < need && k < nPool; k++) {
+        const i = k + Math.floor(rng() * (nPool - k));
+        const t = work[k]; work[k] = work[i]; work[i] = t;
+        run[k] = work[k];
+      }
+      let x = rng() * tot;
+      let lo = 0, hi = vc.length - 1;
+      while (lo < hi) { const mid = (lo + hi) >> 1; if (cum[mid] < x) lo = mid + 1; else hi = mid; }
+      let v = vc[lo];
+      let clash = false;
+      for (let k = 0; k < need; k++) if (run[k] === v[0] || run[k] === v[1]) { clash = true; break; }
+      if (clash) {
+        const ok = vc.filter(c => !run.includes(c[0]) && !run.includes(c[1]));
+        if (!ok.length) continue;
+        v = pickWeighted(ok, rng);
+      }
       const b7 = [...board, ...run];
       const hs = eval7([...combo, ...b7]), vs = eval7([v[0], v[1], ...b7]);
       eq += hs > vs ? 1 : hs < vs ? 0 : 0.5; n++;

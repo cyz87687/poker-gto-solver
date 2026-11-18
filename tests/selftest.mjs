@@ -14,7 +14,10 @@ import {
   initDB, state, commit, upsertSession, upsertHand, sessionNet, computeStats,
   escapeHtml, exportJSON, importJSON, exportSessionsCSV, jobCacheKey
 } from '../js/db.js';
-import { rangesForDecision, preflopRaiseLevel, raiseLevelFraction, narrowRangeTop, applyArchetypeToRange } from '../js/range-by-action.js';
+import {
+  rangesForDecision, preflopRaiseLevel, raiseLevelFraction, narrowRangeTop, applyArchetypeToRange,
+  preflopRaiseTier, archetypeWidth, targetWidthPct, TOTAL_COMBOS
+} from '../js/range-by-action.js';
 
 let pass = 0, fail = 0;
 function ok(name, cond, extra = '') {
@@ -609,8 +612,8 @@ Preflop:  BTN raise 3.5, BB raise 14.0, BTN raise 40.0, BB raise 132.0`;
   ok('fraction=1 原样返回', narrowRangeTop(m, 1) === m);
 
   // 派生范围不影响已存数据
-  const ranges = rangesForDecision(hand, idx);
-  ok('派生说明含加注级别与比例', /加注级别 2/.test(ranges.note) && /16%/.test(ranges.note), ranges.note);
+  const ranges = rangesForDecision(hand, idx, { mode: 'gto', archetype: 'tag', intensity: 1, stackBB: 460 });
+  ok('派生说明含绝对宽度口径与加注档位', /5bet/.test(ranges.note) && /全范围/.test(ranges.note), ranges.note);
   ok('Hero 范围保持原样（手牌已知）', ranges.hero === hand.ranges.hero);
   ok('对手范围被收窄（组合减少）', matrixToCombos(ranges.villain, [], 0.02, 420).length < matrixToCombos(hand.ranges.villain, [], 0.02, 420).length);
 
@@ -713,6 +716,120 @@ console.log('\n[16] V1.14 收敛停止指标（NashConv，而非固定迭代次�
   const rExp = solveCore({ ...req, quality: 'teaching', mode: 'exploit', archetype: 'lag', intensity: 1 });
   ok('剥削模式保留 GTO 基线可剥削度并标注口径', rExp.exploitabilityMbb != null && rExp.nashConvScope === 'gto-reference' && rExp.targetMbb === 50);
   ok('收敛档位纳入求解缓存键', jobCacheKey(h, { quality: 'teaching', decisionIndex: idx }) !== jobCacheKey(h, { quality: 'daily', decisionIndex: idx }));
+}
+
+console.log('\n[16] V1.15 对手范围绝对宽度口径（位置对 × 风格 × 结构修正）');
+{
+  /* 锚点行：BTN 作为再加注方面对 EP 开池 → GTO 8~12%（中值 10%） */
+  const anchorInfo = {
+    tier: 3, openerPos: 'MP', responderPos: 'BTN',
+    opener: { amountBB: 5.0 }, responderRaise: { amountBB: 13.0 }
+  };
+  const wAnchor = targetWidthPct(anchorInfo, { bb: 2, stackBB: 100, styleWidth: 1 });
+  ok('锚点行 GTO 绝对宽度 = 10%（8~12% 中值）', near(wAnchor.pct, 10, 0.05), wAnchor.pct.toFixed(2) + '%');
+  const wLag = targetWidthPct(anchorInfo, { bb: 2, stackBB: 100, styleWidth: 1.4 });
+  const wTag = targetWidthPct(anchorInfo, { bb: 2, stackBB: 100, styleWidth: 0.7 });
+  ok('锚点行风格倍率：LAG 14% / TAG 7%', near(wLag.pct, 14, 0.05) && near(wTag.pct, 7, 0.05),
+    `lag=${wLag.pct.toFixed(2)}% tag=${wTag.pct.toFixed(2)}%`);
+  ok('风格序：LAG > GTO > TAG', wLag.pct > wAnchor.pct && wAnchor.pct > wTag.pct);
+
+  const optG = { mode: 'gto', archetype: 'tag', intensity: 1, stackBB: 100 };
+  /* 位置序：同样的开池尺寸下，BB 面对 EP open 的 3bet 范围比面对 BTN open 更宽 */
+  const mkBB = (heroPos) => ({
+    stakes: { sb: 1, bb: 2 }, stackBB: 100,
+    positions: { hero: heroPos, villain: 'BB' },
+    actions: [
+      { street: 'PREFLOP', type: 'RAISE_TO', amountBB: 5.0, actor: 'HERO' },
+      { street: 'PREFLOP', type: 'RAISE_TO', amountBB: 13.0, actor: 'VILLAIN' }
+    ],
+    ranges: { hero: presetMatrix('btn'), villain: presetMatrix('bb') }
+  });
+  const vsEP = rangesForDecision(mkBB('MP'), 2, optG);
+  const vsBTN = rangesForDecision(mkBB('BTN'), 2, optG);
+  ok('位置序：BB 面对 EP open 的 3bet 范围更宽', vsEP.widthInfo.pct > vsBTN.widthInfo.pct,
+    `EP=${vsEP.widthInfo.pct.toFixed(2)}% BTN=${vsBTN.widthInfo.pct.toFixed(2)}%`);
+  ok('3bet 档识别正确（加注链第 2 位）', vsBTN.widthInfo.tier === '3bet' && vsBTN.widthInfo.chainIndex === 2, vsBTN.widthInfo.tier);
+  ok('GTO 模式不套用画像宽度', near(vsBTN.widthInfo.styleWidth, 1, 1e-9));
+
+  /* 对手是开池方时（Hero 再加注）：按其位置的开池宽度收窄，而不是用位置预设 */
+  const mkOpen = (villainPos) => ({
+    stakes: { sb: 1, bb: 2 }, stackBB: 100,
+    positions: { hero: 'BTN', villain: villainPos },
+    actions: [
+      { street: 'PREFLOP', type: 'RAISE_TO', amountBB: 5.0, actor: 'VILLAIN' },
+      { street: 'PREFLOP', type: 'RAISE_TO', amountBB: 13.0, actor: 'HERO' }
+    ],
+    ranges: { hero: presetMatrix('btn'), villain: presetMatrix('lag') }
+  });
+  const rOpenEP = rangesForDecision(mkOpen('MP'), 2, optG);
+  const rOpenBTN = rangesForDecision(mkOpen('BTN'), 2, optG);
+  ok('对手为开池方时按位置开池宽度收窄（EP 16.5% / BTN 42.5%）',
+    rOpenEP.widthInfo.tier === '开池' && near(rOpenEP.widthInfo.pct, 16.5, 0.1) && near(rOpenBTN.widthInfo.pct, 42.5, 0.1),
+    `EP=${rOpenEP.widthInfo.pct.toFixed(2)}% BTN=${rOpenBTN.widthInfo.pct.toFixed(2)}%`);
+
+  /* 用户场景：BTN 33 面对 BB 3bet 到 12（100BB） */
+  const HH33 = `# PokerGTO HH v1
+Game: NLHE
+Stakes: SB=1 BB=2
+Table: 6max
+Hero: BTN [3c3d]
+Stacks: Hero=100 Villain=100 (BB)
+Preflop:  BTN raise 3.5, BB raise 12.0`;
+  const { hand: h33 } = parseHH(HH33);
+  const idx33 = pendingHeroDecision(h33).index;
+  const st33 = deriveState(h33, idx33);
+  const rg33 = rangesForDecision(h33, idx33, { ...optG, stackBB: st33.rem.hero });
+  ok('用户场景：对手 3bet 范围收窄到全范围 9%~15%（旧口径为 36.5%）',
+    rg33.widthInfo.pct > 9 && rg33.widthInfo.pct < 15, rg33.widthInfo.pct.toFixed(2) + '%');
+  ok('用户场景：派生范围组合数落在目标宽度附近',
+    Math.abs(rg33.widthInfo.actualCombos / TOTAL_COMBOS * 100 - rg33.widthInfo.pct) < 1.5,
+    `${rg33.widthInfo.actualCombos} 组合 / ${TOTAL_COMBOS}`);
+
+  const req33 = {
+    board: [], heroCards: h33.heroCards, villainCards: [], deadCards: [],
+    heroRange: rg33.hero, villainRange: rg33.villain,
+    villainRangeLocked: true, villainRangePreNarrowed: true,
+    pot: st33.pot, stack: st33.stack, facingBet: st33.facingBet,
+    sizes: h33.sizes, allowCheckRaise: h33.allowCheckRaise, preset: 'fast', mode: 'gto', iterations: 12000
+  };
+  const r33 = solveCore(req33);
+  const aggr33 = r33.focus.strategy.filter(a => a.type === 'RAISE' || a.type === 'ALLIN');
+  ok('用户场景：33 不再 100% 4bet / 全下', !aggr33.some(a => a.freq >= 0.9),
+    aggr33.map(a => a.label + ' ' + (a.freq * 100).toFixed(1) + '%').join(', ') || '无激进攻略');
+  ok('用户场景：33 权益不再虚高（旧口径 53.6%）', r33.focus.equityVsVillainRange < 0.45,
+    (r33.focus.equityVsVillainRange * 100).toFixed(1) + '%');
+
+  /* 深码 5bet：弱牌不得被推向全下 */
+  const HHDeep = `# PokerGTO HH v1
+Game: NLHE
+Stakes: SB=1 BB=2
+Table: 6max
+Hero: BTN [3c3d]
+Stacks: Hero=500 Villain=500 (BB)
+Preflop:  BTN raise 3.5, BB raise 14.0, BTN raise 40.0, BB raise 132.0`;
+  const { hand: hd } = parseHH(HHDeep);
+  const idxd = pendingHeroDecision(hd).index;
+  const std = deriveState(hd, idxd);
+  const rgd = rangesForDecision(hd, idxd, { ...optG, stackBB: std.rem.hero });
+  ok('深码场景识别为 5bet 档', rgd.widthInfo.tier === '5bet', rgd.widthInfo.tier);
+  ok('深码 5bet 范围极窄（< 4% 全范围）', rgd.widthInfo.pct < 4, rgd.widthInfo.pct.toFixed(2) + '%');
+  const rd = solveCore({
+    board: [], heroCards: hd.heroCards, villainCards: [], deadCards: [],
+    heroRange: rgd.hero, villainRange: rgd.villain,
+    villainRangeLocked: true, villainRangePreNarrowed: true,
+    pot: std.pot, stack: std.stack, facingBet: std.facingBet,
+    sizes: hd.sizes, allowCheckRaise: hd.allowCheckRaise, preset: 'fast', mode: 'gto', iterations: 12000
+  });
+  const recd = rd.focus.strategy.slice().sort((a, b) => b.freq - a.freq)[0];
+  ok('深码 5bet：33 不再推荐全下', recd.type !== 'ALLIN', recd.label + ' ' + (recd.freq * 100).toFixed(0) + '%');
+
+  /* 管线：宽度已在派生层算好，求解器不得二次调整；派生不得写回已存范围 */
+  ok('preNarrowed 时求解器不再二次调整宽度',
+    applyArchetypeToRange(rg33.villain, ARCHETYPE_PARAMS.lag.width, 1, true, true) === rg33.villain);
+  const snapBefore = JSON.stringify(h33.ranges.villain);
+  rangesForDecision(h33, idx33, { mode: 'exploit', archetype: 'lag', intensity: 1.5, stackBB: 100 });
+  ok('派生范围不写回已存 hand.ranges', JSON.stringify(h33.ranges.villain) === snapBefore);
+  ok('画像宽度倍率随强度插值', near(archetypeWidth('lag', 1.5), 1.6, 1e-9) && near(archetypeWidth('tag', 0.5), 0.85, 1e-9));
 }
 
 console.log(`\n结果：${pass} 通过 / ${fail} 失败\n`);

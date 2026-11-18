@@ -9,15 +9,11 @@ import {
   deckExcluding, mulberry32, hashSeed, cardStr, eval7
 } from './cards.js';
 import { applyArchetypeToRange } from './range-by-action.js';
+import { ARCHETYPE_PARAMS } from './archetypes.js';
 
 export const N_BUCKETS = 10;
-export const ARCHETYPE_PARAMS = {
-  tag: { width: 0.70, aggression: 0.15, bluff: -0.10, foldToBet: 0.00, foldToRaise: 0.05, raiseThreshold: 0.20 },
-  lag: { width: 1.40, aggression: 0.25, bluff: 0.20, foldToBet: -0.15, foldToRaise: -0.10, raiseThreshold: 0.00 },
-  tp:  { width: 0.75, aggression: -0.20, bluff: -0.15, foldToBet: 0.25, foldToRaise: 0.30, raiseThreshold: 0.50 },
-  lp:  { width: 1.30, aggression: -0.15, bluff: -0.10, foldToBet: 0.05, foldToRaise: 0.15, raiseThreshold: 0.45 },
-  cs:  { width: 1.60, aggression: -0.30, bluff: -0.25, foldToBet: -0.30, foldToRaise: -0.25, raiseThreshold: 0.85 }
-};
+/* V1.15：画像参数集中到 archetypes.js，solver-core 与范围派生层共用同一份口径 */
+export { ARCHETYPE_PARAMS };
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 const other = p => p === 'hero' ? 'villain' : 'hero';
 /** 频率四舍五入后把舍入残差并入最大项，保证合计严格 = 100%（PRD U2 验收） */
@@ -519,8 +515,9 @@ export function solveCore(req, onProgress = () => {}) {
   let heroRange = req.heroRange, villainRange = req.villainRange;
   if (req.mode === 'exploit') {
     const A = ARCHETYPE_PARAMS[req.archetype] || ARCHETYPE_PARAMS.tag;
-    // V1.12 行动一致范围不能被画像重新放宽（否则深码 5bet 弱牌全下复活）
-    villainRange = applyArchetypeToRange(villainRange, A.width, ctx.intensity, req.villainRangeLocked === true);
+    // V1.15：范围宽度已由派生层按「绝对宽度目标」算好（位置对 × 风格 × 结构修正），
+    // 此处不再二次调整宽度，否则松型画像会重复放大已经按绝对宽度收窄的范围。
+    villainRange = applyArchetypeToRange(villainRange, A.width, ctx.intensity, req.villainRangeLocked === true, req.villainRangePreNarrowed === true);
   }
   const heroCombos = matrixToCombos(heroRange, blockedShared, 0.02, 380);
   // cap 采样可能剔除 Hero 已知手牌：强制补入，保证手牌条件频率与权益取到真实目标
@@ -538,12 +535,18 @@ export function solveCore(req, onProgress = () => {}) {
   const villainCombos = matrixToCombos(villainRange, usedVillain, 0.02, 380);
   if (!heroCombos.length || !villainCombos.length) throw new Error('范围为空：与手牌/公共牌/死牌冲突后无可用组合，请放宽范围');
 
-  const samples = board.length >= 5 ? 0 : board.length === 0 ? 96 : 84;
+  /* V1.15：翻前权益采样数 96 → 512。原先 96 次采样的标准误约 4.9%，
+   * 会让「33 面对 3bet」的权益在门槛线两侧抖动，推荐动作随之翻转（弃牌/跟注）。 */
+  const samples = board.length >= 5 ? 0 : board.length === 0 ? 512 : 256;
   const heroEq = heroCombos.map(c => comboEquityVsRange([c[0], c[1]], villainCombos, board, samples, rng));
   const villainEq = villainCombos.map(c => comboEquityVsRange([c[0], c[1]], heroCombos, board, samples, rng));
+  // focus 手牌的高精度权益重算上下文（独立 rng，seed 只取已确定的求解输入）
+  const eqCtx = { villainCombos, board, samples: board.length >= 5 ? 2048 : 4096, key: seed };
   const hb = bucketize(heroCombos, heroEq, N_BUCKETS);
   const vb = bucketize(villainCombos, villainEq, N_BUCKETS);
-  ctx.E = buildEquityMatrix(heroCombos, villainCombos, hb, vb, board, N_BUCKETS, board.length === 0 ? 28 : 20, rng);
+  /* 桶级权益矩阵：原先每桶对仅 28 次采样（标准误约 9.4%），会把 EV 估算出噪声，
+   * 直接影响 CFR 的动作选择。V1.15 提到 128 次（标准误约 4.4%）。 */
+  ctx.E = buildEquityMatrix(heroCombos, villainCombos, hb, vb, board, N_BUCKETS, board.length === 0 ? 128 : 96, rng);
   const pH = new Float64Array(N_BUCKETS), pV = new Float64Array(N_BUCKETS);
   heroCombos.forEach((_, i) => { pH[hb.bucketOf[i]] += 1; });
   villainCombos.forEach((_, i) => { pV[vb.bucketOf[i]] += 1; });
@@ -595,7 +598,7 @@ export function solveCore(req, onProgress = () => {}) {
       hero: heatFor(ctx, root, heroCombos, hb, villainCombos, vb, 'hero'),
       villain: heatFor(ctx, root, heroCombos, hb, villainCombos, vb, 'villain')
     },
-    focus: focusStrategy(req, rootNode, rootActs, heroCombos, hb, heroEq, pH),
+    focus: focusStrategy(req, rootNode, rootActs, heroCombos, hb, heroEq, pH, eqCtx),
     eqEV: Math.round(eqEV * 100) / 100,
     convergence: {
       equilibriumEV: Math.round(eqEV * 100) / 100,
@@ -640,13 +643,13 @@ export function solveCore(req, onProgress = () => {}) {
     // 剥削路线本身不是均衡，NashConv 无意义；保留 GTO 基线值供 UI 标注「均衡参考可剥削度」
     exploitabilityMbb, nashConvScope: 'gto-reference',
     // 剥削路线也要给出「你的手牌」条件策略，否则结果页仍显示 GTO 档位
-    focus: focusStrategy(req, expRootNode, rootActs, heroCombos, hb, heroEq, pH) || base.focus,
+    focus: focusStrategy(req, expRootNode, rootActs, heroCombos, hb, heroEq, pH, eqCtx) || base.focus,
     iterationsExploit: expItersRun,
     actions: rootActs.map((a, i) => ({ type: a.type, sizeBB: a.raiseTo != null ? a.raiseTo : (a.amount != null ? a.amount : null), label: a.label, freq: expFreqRounded[i], ev: expEV[i] })),
     evLossBB: expUserLoss,
     gtoActions: base.actions,
     gtoEvLossBB: base.evLossBB,
-    lockedInfo: { params: ARCHETYPE_PARAMS[req.archetype] || ARCHETYPE_PARAMS.tag, widthApplied: true, rangeClamped: req.villainRangeLocked === true },
+    lockedInfo: { params: ARCHETYPE_PARAMS[req.archetype] || ARCHETYPE_PARAMS.tag, widthApplied: true, rangeClamped: req.villainRangeLocked === true, widthSource: req.villainRangePreNarrowed === true ? 'action-consistent-absolute' : 'preset-width' },
     durationMs: Date.now() - t0
   };
 }
@@ -668,7 +671,7 @@ function matchUserAction(acts, user) {
   }
   return idx;
 }
-function focusStrategy(req, rootNode, acts, combos, hb, eq, pH) {
+function focusStrategy(req, rootNode, acts, combos, hb, eq, pH, eqCtx) {
   const hc = req.heroCards || [];
   if (hc.length !== 2) return null;
   const target = combos.findIndex(c => c[0] === hc[0] && c[1] === hc[1]);
@@ -680,7 +683,14 @@ function focusStrategy(req, rootNode, acts, combos, hb, eq, pH) {
   }
   const s = avgStrat(rootNode, 'hero', b, acts.length);
   const sr = roundedFreqs(Array.from(s));
-  return { cards: hc.map(cardStr), bucket: b, equityVsVillainRange: Math.round((eq[target >= 0 ? target : 0] || 0.5) * 1000) / 1000, strategy: acts.map((a, i) => ({ type: a.type, label: a.label, freq: sr[i] })) };
+  // V1.15：focus 手牌的权益单独用高精度采样重算（独立 rng，不污染主流，结论可复现）。
+  // 全范围的桶权益仍用主采样值，保证策略频率与分桶口径一致。
+  let eqFocus = (eq[target >= 0 ? target : 0] || 0.5);
+  if (target >= 0 && eqCtx && eqCtx.villainCombos && eqCtx.villainCombos.length && eqCtx.samples > 0) {
+    const r2 = mulberry32(hashSeed('focus|' + JSON.stringify(eqCtx.key || '')));
+    eqFocus = comboEquityVsRange([hc[0], hc[1]], eqCtx.villainCombos, eqCtx.board || [], eqCtx.samples, r2);
+  }
+  return { cards: hc.map(cardStr), bucket: b, equityVsVillainRange: Math.round(eqFocus * 1000) / 1000, strategy: acts.map((a, i) => ({ type: a.type, label: a.label, freq: sr[i] })) };
 }
 
 /** 路线预览：在采样 runout 后的下一条街重新快解 */
