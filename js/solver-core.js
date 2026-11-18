@@ -6,8 +6,9 @@
  */
 import {
   matrixToCombos, comboEquityVsRange, bucketize, buildEquityMatrix,
-  deckExcluding, mulberry32, hashSeed, cardStr, eval7, applyRangeWidth
+  deckExcluding, mulberry32, hashSeed, cardStr, eval7
 } from './cards.js';
+import { applyArchetypeToRange } from './range-by-action.js';
 
 export const N_BUCKETS = 10;
 export const ARCHETYPE_PARAMS = {
@@ -108,7 +109,9 @@ function actionList(s, ctx) {
           acts.push({ type: 'RAISE', amount: incR, raiseTo, size, key: 'R' + size, label: `加注至 ${raiseTo.toFixed(1)} BB` });
         }
       }
-      if (rem > s.toCall * 2 && rem <= 3.2 * s.pot) {
+      // 全下只在「相对底池合理」的深度进入均衡动作集：深码超底池 all-in 需极端弃牌率，
+      // 近似模型会系统性高估其 EV（深码 5bet 弱牌被判 100% 全下），故不再作为常规尺度。
+      if (rem > s.toCall * 2 && rem <= 1.5 * s.pot) {
         const aiAmt = Math.round(rem * 10) / 10;
         acts.push({ type: 'ALLIN', amount: aiAmt, key: 'AI', label: `全下 ${aiAmt.toFixed(1)} BB` });
       }
@@ -123,7 +126,7 @@ function actionList(s, ctx) {
           acts.push({ type: 'BET', amount: amtR, size, key: 'B' + size, label: `下注 ${amtR.toFixed(1)} BB` });
         }
       }
-      if (rem <= 3.2 * s.pot && rem > 1.2) {
+      if (rem <= 1.5 * s.pot && rem > 1.2) {
         const aiAmt = Math.round(rem * 10) / 10;
         acts.push({ type: 'ALLIN', amount: aiAmt, key: 'AI', label: `全下 ${aiAmt.toFixed(1)} BB` });
       }
@@ -439,17 +442,37 @@ export function solveCore(req, onProgress = () => {}) {
   const treeSize = countTree(ctx, root);
   if (treeSize > 600) throw new Error('分支过大：请压缩下注尺度集合或收窄对手范围后重试');
 
-  const seed = hashSeed(JSON.stringify([board, req.heroRange, req.villainRange, req.pot, req.stack, req.sizes, req.mode, req.archetype, req.intensity]));
+  // 随机种子只纳入真正影响求解的输入：GTO 结果与 UI 上残留的画像参数无关。
+  // 否则 archetype/intensity 变化会改变蒙特卡洛采样，同一局面可能随机翻转成「100% 全下」。
+  const seedKey = [board, req.heroRange, req.villainRange, req.pot, req.stack, req.sizes, req.mode];
+  if (req.mode === 'exploit') seedKey.push(req.archetype, req.intensity);
+  const seed = hashSeed(JSON.stringify(seedKey));
   const rng = mulberry32(seed);
   onProgress(0.03, '展开范围与计算摊牌权益');
-  const used = [...board, ...(req.heroCards || []), ...(req.villainCards || []), ...(req.deadCards || [])];
+  // Hero 组合集不能排除 Hero 自己的手牌：否则 focusStrategy 永远找不到目标手牌，
+  // 权益取 eq[0]（随手一张牌）、策略桶取全范围平均。对手组合仍须排除 Hero 已知牌。
+  const blockedShared = [...board, ...(req.villainCards || []), ...(req.deadCards || [])];
+  const usedVillain = [...blockedShared, ...(req.heroCards || [])];
   let heroRange = req.heroRange, villainRange = req.villainRange;
   if (req.mode === 'exploit') {
     const A = ARCHETYPE_PARAMS[req.archetype] || ARCHETYPE_PARAMS.tag;
-    villainRange = applyRangeWidth(villainRange, A.width, ctx.intensity);
+    // V1.12 行动一致范围不能被画像重新放宽（否则深码 5bet 弱牌全下复活）
+    villainRange = applyArchetypeToRange(villainRange, A.width, ctx.intensity, req.villainRangeLocked === true);
   }
-  const heroCombos = matrixToCombos(heroRange, used, 0.02, 380);
-  const villainCombos = matrixToCombos(villainRange, used, 0.02, 380);
+  const heroCombos = matrixToCombos(heroRange, blockedShared, 0.02, 380);
+  // cap 采样可能剔除 Hero 已知手牌：强制补入，保证手牌条件频率与权益取到真实目标
+  const heroHand = req.heroCards || [];
+  if (heroHand.length === 2) {
+    const hit = heroCombos.findIndex(c => c[0] === heroHand[0] && c[1] === heroHand[1]);
+    if (hit < 0) {
+      const [i, j] = comboClassIndices(heroHand[0], heroHand[1]);
+      const w = Math.max(0.02, Number(heroRange?.[i]?.[j]) || 0.02);
+      const known = [heroHand[0], heroHand[1], w];
+      if (heroCombos.length >= 380) heroCombos[heroCombos.length - 1] = known;
+      else heroCombos.push(known);
+    }
+  }
+  const villainCombos = matrixToCombos(villainRange, usedVillain, 0.02, 380);
   if (!heroCombos.length || !villainCombos.length) throw new Error('范围为空：与手牌/公共牌/死牌冲突后无可用组合，请放宽范围');
 
   const samples = board.length >= 5 ? 0 : board.length === 0 ? 96 : 84;
@@ -526,7 +549,8 @@ export function solveCore(req, onProgress = () => {}) {
   const expHeroStrat = (state, bucket, acts) => avgStrat(exp.nodes.get(state.key), 'hero', bucket, acts.length);
   const gtoVsLocked = dealLoop(ctx, root, (bh, bv, pD) => evaluate(root, bh, bv, pD, ctx, { heroStrat: avgHero, villainStrat: lockedProvider }));
   const expVsLocked = dealLoop(ctx, root, (bh, bv, pD) => evaluate(root, bh, bv, pD, exp, { heroStrat: expHeroStrat, villainStrat: lockedProvider }));
-  const exploitGainBB = Math.round(Math.max(0, expVsLocked - gtoVsLocked) * 100) / 100;
+  // 允许负增益：剥削路线劣于 GTO 时必须如实呈现，供 UI 提示「剥削更差」
+  const exploitGainBB = Math.round((expVsLocked - gtoVsLocked) * 100) / 100;
 
   const expRootNode = exp.nodes.get('');
   const brChoice = new Array(rootActs.length).fill(0);
@@ -543,13 +567,15 @@ export function solveCore(req, onProgress = () => {}) {
   return {
     ...base, mode: 'exploit', archetype: req.archetype, intensity: ctx.intensity,
     exploitGainBB, archetypeLabel: (req.archetype || '').toUpperCase(),
+    // 剥削路线也要给出「你的手牌」条件策略，否则结果页仍显示 GTO 档位
+    focus: focusStrategy(req, expRootNode, rootActs, heroCombos, hb, heroEq, pH) || base.focus,
     iterationsExploit: expItersRun,
     actions: rootActs.map((a, i) => ({ type: a.type, sizeBB: a.raiseTo != null ? a.raiseTo : (a.amount != null ? a.amount : null), label: a.label, freq: expFreqRounded[i], ev: expEV[i] })),
     evLossBB: expUserLoss,
     gtoActions: base.actions,
     gtoEvLossBB: base.evLossBB,
     exploitabilityMbb: null,
-    lockedInfo: { params: ARCHETYPE_PARAMS[req.archetype] || ARCHETYPE_PARAMS.tag, widthApplied: true },
+    lockedInfo: { params: ARCHETYPE_PARAMS[req.archetype] || ARCHETYPE_PARAMS.tag, widthApplied: true, rangeClamped: req.villainRangeLocked === true },
     durationMs: Date.now() - t0
   };
 }
