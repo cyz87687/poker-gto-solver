@@ -260,6 +260,20 @@ export function validateHand(hand) {
   let pot = blindsBB;
   const invest = new Map(); // 行动者(归一后) -> 本街累计投入
   const totalMap = new Map(); // 行动者(归一后) -> 跨街累计投入（后手钳制用，换街不清零）
+  // 盲注已计入起始底池，也要记入账户，保证 pot / 待跟注额 / 后手与 deriveState 同口径
+  const sbActorV = heroPosU === 'BTN' || heroPosU === 'SB' ? heroPosU
+    : villainPosU === 'BTN' || villainPosU === 'SB' ? villainPosU : null;
+  const bbActorV = heroPosU === 'BB' ? heroPosU : villainPosU === 'BB' ? villainPosU : null;
+  const blindCells = [];
+  if (sbActorV) blindCells.push([sbActorV, sb / bb]);
+  if (bbActorV) blindCells.push([bbActorV, 1]);
+  const seedBlinds = withTotal => {
+    for (const [actor, amt] of blindCells) {
+      invest.set(actor, amt);
+      if (withTotal) totalMap.set(actor, amt);
+    }
+  };
+  seedBlinds(true);
   let toCall = 1; // 大盲 1BB 视作待跟注额（翻前）
   let lastRaise = 1;
   let streetSeen = -1;
@@ -288,6 +302,7 @@ export function validateHand(hand) {
       }
       streetSeen = si; invest.clear(); toCall = si === 0 ? 1 : 0; lastRaise = 1; allInSides.clear();
       actedSet = new Set(); roundClosed = false; streetActionCount = 0;
+      if (si === 0) seedBlinds(false);
     }
     const actor = normActor(a.actor);
     if (si > 0) postActors.add(actor);
@@ -347,7 +362,8 @@ export function validateHand(hand) {
         break;
       }
       case 'RAISE_TO': {
-        const highest = Math.max(0, ...invest.values());
+        // 最高下注额须排除行动者自己，否则「自己已投入 1BB 大盲」会被算成对手下注，待跟注额虚高
+        const highest = Math.max(0, ...[...invest.entries()].filter(([k]) => k !== actor).map(([, v]) => v));
         const minTo = highest + lastRaise;
         if (toCall <= 0) errors.push({ path, msg: '无待跟注额时不能加注' });
         if (amt == null) errors.push({ path, msg: 'RAISE_TO 缺少目标额' });
@@ -600,6 +616,15 @@ export function normalizeActionAmounts(actions, hand) {
   let pot = sb / bb + 1, toCall = 1, lastRaise = 1, streetSeen = -1;
   const invest = new Map();
   const totalMap = new Map(); // 跨街累计（钳制重放用）
+  // 与 deriveState 同口径：盲注已包含在起始底池中，也要记入对应账户后手
+  const hp = String(hand?.positions?.hero || '').toUpperCase();
+  const vp = String(hand?.positions?.villain || '').toUpperCase();
+  const blindActors = [];
+  if (hp === 'BTN' || hp === 'SB') blindActors.push([hp, sb / bb]);
+  else if (vp === 'BTN' || vp === 'SB') blindActors.push([vp, sb / bb]);
+  if (hp === 'BB') blindActors.push([hp, 1]);
+  else if (vp === 'BB') blindActors.push([vp, 1]);
+  for (const [actor, amt] of blindActors) { invest.set(actor, amt); totalMap.set(actor, amt); }
   return (actions || []).map(raw => {
     const a = { ...raw, street: String(raw.street || '').toUpperCase(), actor: String(raw.actor || '').toUpperCase() };
     const si = STREETS.indexOf(a.street);
@@ -637,6 +662,23 @@ export function deriveState(hand, decisionIndex) {
   const invest = new Map();
   const totalInvest = { hero: 0, villain: 0, other: 0 };
   let streetInv = { hero: 0, villain: 0, other: 0 };
+  // 盲注已计入起始底池，也必须计入对应账户投入：否则翻前后手高估 0.5~1BB
+  const heroPos = String(hand.positions?.hero || '').toUpperCase();
+  const villainPos = String(hand.positions?.villain || '').toUpperCase();
+  const sbActor = heroPos === 'BTN' || heroPos === 'SB' ? heroPos
+    : villainPos === 'BTN' || villainPos === 'SB' ? villainPos : null;
+  const bbActor = heroPos === 'BB' ? heroPos : villainPos === 'BB' ? villainPos : null;
+  const blinds = [];
+  if (sbActor) blinds.push([sbActor, sb / bb]);
+  if (bbActor) blinds.push([bbActor, 1]);
+  const applyBlinds = withTotal => {
+    for (const [actor, amt] of blinds) {
+      const side = actorSide(hand, actor);
+      invest.set(actor, amt); streetInv[side] += amt;
+      if (withTotal) totalInvest[side] += amt;
+    }
+  };
+  applyBlinds(true);
   const stackBB = num(hand.stackBB) || 0;
   let toCall = 1, lastRaise = 1, streetSeen = -1, lastAggSide = null, lastStreet = 'PREFLOP';
   const actions = hand.actions || [];
@@ -648,6 +690,7 @@ export function deriveState(hand, decisionIndex) {
     if (si > streetSeen) {
       streetSeen = si; invest.clear(); toCall = si === 0 ? 1 : 0; lastRaise = 1; lastAggSide = null;
       streetInv = { hero: 0, villain: 0, other: 0 };
+      if (si === 0) applyBlinds(false); // 换街重置街内投入，但翻前盲注仍应计入
     }
     lastStreet = st;
     const side = actorSide(hand, a.actor);
