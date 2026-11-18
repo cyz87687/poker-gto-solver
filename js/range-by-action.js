@@ -9,7 +9,25 @@
  * 不改动 IndexedDB 已录数据。Hero 手牌已知，其范围保持原样，避免手牌条件频率
  * 因手牌被排除而退化成平均档位。
  */
-import { emptyMatrix } from './cards.js';
+import { emptyMatrix, applyRangeWidth } from './cards.js';
+
+/**
+ * 把剥削画像宽度作用到对手范围。
+ * 当范围已被行动历史收窄（actionLocked=true）时，松型画像（width>1，如 LAG/LP/CS）
+ * 绝不能把已被剔除的组合「复活」——否则 V1.12 修掉的深码 5bet 弱牌全下会重新出现；
+ * 紧型画像（width<1）仍可在此基础上进一步收紧。
+ */
+export function applyArchetypeToRange(actionMatrix, width, intensity = 1, actionLocked = false) {
+  if (!actionMatrix) return actionMatrix;
+  if (!actionLocked) return applyRangeWidth(actionMatrix, width, intensity);
+  const tightened = applyRangeWidth(actionMatrix, Math.min(1, Number(width) || 1), intensity);
+  const out = emptyMatrix();
+  for (let i = 0; i < 13; i++) for (let j = 0; j < 13; j++) {
+    const locked = Number(actionMatrix[i]?.[j]) || 0;
+    out[i][j] = locked < 0.02 ? 0 : Math.min(locked, Number(tightened[i]?.[j]) || 0);
+  }
+  return out;
+}
 
 /** 与 cards.js 的 classScore 同源：牌型强度评分（用于按强度保留最强组合） */
 function strength(i, j) {
