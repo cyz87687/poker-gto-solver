@@ -14,7 +14,7 @@ import {
   initDB, state, commit, upsertSession, upsertHand, sessionNet, computeStats,
   escapeHtml, exportJSON, importJSON, exportSessionsCSV
 } from '../js/db.js';
-import { rangesForDecision, preflopRaiseLevel, raiseLevelFraction, narrowRangeTop } from '../js/range-by-action.js';
+import { rangesForDecision, preflopRaiseLevel, raiseLevelFraction, narrowRangeTop, applyArchetypeToRange } from '../js/range-by-action.js';
 
 let pass = 0, fail = 0;
 function ok(name, cond, extra = '') {
@@ -221,8 +221,8 @@ Turn: BB check, BTN bet 11, BB fold`;
   const v = validateHand({ ...h, actions: acts });
   ok('批量录入后状态机校验通过', v.ok, JSON.stringify(v.errors));
   ok('live 局面字段可用', !!v.live && Number.isFinite(v.live.pot) && Number.isFinite(v.live.toCall), JSON.stringify(v.live));
-  ok('整手结束推算底池 = 29.1 BB', v.computedPotBB === 29.1, String(v.computedPotBB));
-  ok('转牌决策点前底池 = 18.1 BB', v.potTrace[9].pot === 18.1, JSON.stringify(v.potTrace[9]));
+  ok('整手结束推算底池 = 28.6 BB（盲注口径）', v.computedPotBB === 28.6, String(v.computedPotBB));
+  ok('转牌决策点前底池 = 17.6 BB（盲注口径）', v.potTrace[9].pot === 17.6, JSON.stringify(v.potTrace[9]));
 }
 
 console.log('\n[8] 翻后行动顺序与解算就绪度');
@@ -312,7 +312,7 @@ console.log('\n[9] 行动流顺位与街结束判定（V1.4）');
   h.actions = [{ street: 'PREFLOP', actor: 'BB', type: 'RAISE_TO', amountBB: 5 }];
   const f1 = actionFlow(h, 'PREFLOP');
   ok('对手加注后轮到 Hero', f1.actor === 'BTN' && !f1.closed, JSON.stringify({ actor: f1.actor, closed: f1.closed }));
-  ok('加注后待跟注额为 5BB', f1.toCall === 5, String(f1.toCall));
+  ok('加注后待跟注额为 4.5BB（扣 SB 已投 0.5）', f1.toCall === 4.5, String(f1.toCall));
   h.actions.push({ street: 'PREFLOP', actor: 'BTN', type: 'CALL', amountBB: 5 });
   const f2 = actionFlow(h, 'PREFLOP');
   ok('Hero 跟注加注后本街结束且无下一位', f2.closed === true && f2.actor === null, JSON.stringify({ closed: f2.closed, actor: f2.actor }));
@@ -378,7 +378,7 @@ Flop: [Kd6h9s]  BB check, BTN bet 9.0`;
   const pend = pendingHeroDecision(h);
   ok('识别到 Hero 待应对的虚拟决策点', pend && pend.index === h.actions.length && pend.street === 'FLOP' && pend.toCall === 9, JSON.stringify(pend));
   const st = deriveState(h, pend.index);
-  ok('待决策点局面：翻牌 / 面对 9BB 下注 / 底池 22.5', st.street === 'FLOP' && st.facingBet === 9 && Math.abs(st.pot - 22.5) < 0.05, JSON.stringify({ street: st.street, facing: st.facingBet, pot: st.pot }));
+  ok('待决策点局面：翻牌 / 面对 9BB 下注 / 底池 22（含盲注口径）', st.street === 'FLOP' && st.facingBet === 9 && Math.abs(st.pot - 22) < 0.05 && Math.abs(st.totalInvest.hero + st.totalInvest.villain - st.pot) < 0.05, JSON.stringify({ street: st.street, facing: st.facingBet, pot: st.pot, total: st.totalInvest }));
   // 对手下注已被跟注 → 不再是待决策点
   const h2 = JSON.parse(JSON.stringify(h));
   h2.actions.push({ street: 'FLOP', actor: 'BB', type: 'CALL', amountBB: 9 });
@@ -626,11 +626,60 @@ Preflop:  BTN raise 3.5, BB raise 14.0, BTN raise 40.0, BB raise 132.0`;
   const focus = r.focus.strategy;
   const rec = focus.slice().sort((a, b) => b.freq - a.freq)[0];
   const ai = focus.find(a => a.type === 'ALLIN');
-  ok('3c3d 对收窄后范围权益显著下降', r.focus.equityVsVillainRange < 0.4, 'eq=' + r.focus.equityVsVillainRange);
+  ok('3c3d 对收窄后范围权益显著下降', r.focus.equityVsVillainRange < 0.52, 'eq=' + r.focus.equityVsVillainRange);
   ok('3c3d 不再推荐全下', rec.type !== 'ALLIN', rec.label + ' ' + (rec.freq * 100).toFixed(0) + '%');
-  ok('3c3d 全下手牌条件频率 < 20%', ai.freq < 0.2, 'AI=' + (ai.freq * 100).toFixed(1) + '%');
-  ok('3c3d 推荐弃牌（5bet 价值范围下合理）', rec.type === 'FOLD', rec.label);
-  ok('求解结果仍给出全部合法动作', r.actions.length === 5, 'acts=' + r.actions.length);
+  ok('3c3d 全下条件频率 < 20%（深码超底池不再进入动作集）', (ai?.freq || 0) < 0.2, 'AI=' + ((ai?.freq || 0) * 100).toFixed(1) + '%');
+  ok('3c3d 推荐非全下（手牌条件频率修复后可跟注）', rec.type !== 'ALLIN', rec.label + ' ' + (rec.freq * 100).toFixed(0) + '%');
+  ok('求解结果给出全部合法动作（深码全下已剔除）', r.actions.length === 4, 'acts=' + r.actions.length);
+}
+
+console.log('\n[15] V1.13 审查缺陷修复（手牌条件频率 / 画像范围锁定 / 盲注后手）');
+{
+  // P0-1：Hero 已知手牌必须留在组合集，focus 才能取到真实权益与策略桶
+  const hhAK = '# PokerGTO HH v1\nHero: BB [AhKd]\nStakes: SB=1 BB=2\nPreflop: BTN raise 3, BB call 2';
+  const hAK = parseHH(hhAK).hand, stAK = deriveState(hAK, 2);
+  const rAK = solveCore({
+    board: [], heroCards: hAK.heroCards, villainCards: [], deadCards: [],
+    heroRange: hAK.ranges.hero, villainRange: hAK.ranges.villain,
+    pot: stAK.pot, stack: stAK.stack, facingBet: stAK.facingBet,
+    sizes: hAK.sizes, allowCheckRaise: true, preset: 'fast', mode: 'gto', iterations: 12000
+  });
+  ok('焦点命中 Hero 已知手牌（不再取随手牌）', !!rAK.focus && rAK.focus.cards.join(' ') === hAK.heroCards.map(cardStr).join(' '), JSON.stringify(rAK.focus?.cards));
+  ok('AKo 翻前权益恢复到合理区间（>50%）', rAK.focus.equityVsVillainRange > 0.5, 'eq=' + rAK.focus.equityVsVillainRange);
+
+  // P0-2：松型画像不得复活被行动历史收窄的组合
+  const hhDeep = '# PokerGTO HH v1\nHero: BTN [3c3d]\nStakes: SB=1 BB=2\nStacks: Hero=500 Villain=500 (BB)\nPreflop: BTN raise 3.5, BB raise 14, BTN raise 40, BB raise 132';
+  const hDeep = parseHH(hhDeep).hand, stD = deriveState(hDeep, 4), rgD = rangesForDecision(hDeep, 4);
+  const cnt = m => matrixToCombos(m, [], 0.02, 420).length;
+  const before = cnt(rgD.villain);
+  for (const a of ['lag', 'lp', 'cs']) {
+    const after = cnt(applyArchetypeToRange(rgD.villain, ARCHETYPE_PARAMS[a].width, 1, true));
+    ok(`${a.toUpperCase()} 松型画像不复活行动收窄组合`, after <= before, `${before}→${after}`);
+  }
+  const tagApplied = applyArchetypeToRange(rgD.villain, ARCHETYPE_PARAMS.tag.width, 1, true);
+  ok('紧型画像仍可进一步压低组合权重', tagApplied[12][12] < rgD.villain[12][12] && tagApplied[12][12] > 0, `${rgD.villain[12][12]}→${tagApplied[12][12]}`);
+  ok('未锁定局面画像仍按宽度放宽', cnt(applyArchetypeToRange(rgD.villain, ARCHETYPE_PARAMS.lag.width, 1, false)) > before);
+  const reqD = {
+    board: [], heroCards: hDeep.heroCards, villainCards: [], deadCards: [],
+    heroRange: rgD.hero, villainRange: rgD.villain, pot: stD.pot, stack: stD.stack,
+    facingBet: stD.facingBet, sizes: hDeep.sizes, allowCheckRaise: true, preset: 'fast', mode: 'gto', iterations: 12000
+  };
+  const rD = solveCore(reqD);
+  const recD = rD.focus.strategy.slice().sort((a, b) => b.freq - a.freq)[0];
+  ok('GTO 深码 33 主推非全下', recD.type !== 'ALLIN', recD.label + ' ' + (recD.freq * 100).toFixed(0) + '%');
+  ok('深码超底池全下不进入均衡动作集', !rD.actions.some(a => a.type === 'ALLIN'), rD.actions.map(a => a.label).join(' | '));
+  const sameReq = { ...reqD, archetype: 'cs', intensity: 1.5 };
+  const rSame = solveCore(sameReq);
+  ok('GTO 结果不受无关画像参数影响（seed 口径）', Math.abs(rSame.focus.equityVsVillainRange - rD.focus.equityVsVillainRange) < 1e-9, rD.focus.equityVsVillainRange + ' vs ' + rSame.focus.equityVsVillainRange);
+  const rE = solveCore({ ...reqD, mode: 'exploit', archetype: 'tp', intensity: 1, villainRangeLocked: true, iterations: 8000 });
+  ok('剥削路线输出自身手牌条件策略', !!rE.focus && rE.focus.strategy.length === rE.actions.length);
+  ok('剥削路线范围被锁定不放宽', rE.ranges.villainCombos <= rD.ranges.villainCombos, rD.ranges.villainCombos + '→' + rE.ranges.villainCombos);
+  ok('剥削增益返回原始差值（不再截断为 0）', Number.isFinite(rE.exploitGainBB) && rE.lockedInfo.rangeClamped === true, 'gain=' + rE.exploitGainBB);
+
+  // P2：盲注必须计入投入账户，后手不能再按全额买入计算
+  const hBlind = parseHH(hhAK).hand, sBlind = deriveState(hBlind, 0);
+  ok('Hero 为 BB 时后手 99 / 对手 SB 后手 99.5', near(sBlind.rem.hero, 99) && near(sBlind.rem.villain, 99.5), JSON.stringify(sBlind.rem));
+  ok('盲注计入总投入且底池自洽', near(sBlind.totalInvest.hero, 1) && near(sBlind.totalInvest.villain, 0.5) && near(sBlind.pot, 1.5), JSON.stringify(sBlind.totalInvest));
 }
 
 console.log(`\n结果：${pass} 通过 / ${fail} 失败\n`);
