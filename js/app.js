@@ -13,6 +13,7 @@ import {
 } from './db.js';
 import { drawCurve, drawBars, renderHeatmapGrid, buildResultImage } from './charts.js';
 import { solveCore, SOLVE_ITER } from './solver-core.js';
+import { solverSizeOptions } from './ui-sizes.js';
 
 const $ = s => document.querySelector(s);
 const app = $('#app');
@@ -576,7 +577,9 @@ function liveWhyHtml(r, req, actsIn = null) {
   const byEV = acts.slice().sort((a, b) => b.ev - a.ev);
   const second = byEV.find(a => a !== rec);
   const lines = [];
-  lines.push(`推荐「${esc(rec.label)}」（频率 ${(rec.freq * 100).toFixed(0)}%）：EV ${rec.ev >= 0 ? '+' : ''}${fmt(rec.ev)} BB${second ? `；次优「${esc(second.label)}」EV ${second.ev >= 0 ? '+' : ''}${fmt(second.ev)} BB` : ''}。`);
+  const pctText = f => f > 0 && f < 0.01 ? '<1%' : (f * 100).toFixed(0) + '%';
+  const secondTag = second && second.ev > rec.ev ? 'EV 更高' : '次优';
+  lines.push(`推荐「${esc(rec.label)}」（频率 ${pctText(rec.freq)}）：EV ${rec.ev >= 0 ? '+' : ''}${fmt(rec.ev)} BB${second ? `；${secondTag}「${esc(second.label)}」（频率 ${pctText(second.freq)}）EV ${second.ev >= 0 ? '+' : ''}${fmt(second.ev)} BB` : ''}。`);
   const toCall = Math.max(0, Number(req.facingBet) || 0);
   const pot = Math.max(0.1, Number(req.pot) || 0.1);
   const needPct = toCall > 0 ? toCall / (pot + toCall) : null;
@@ -629,14 +632,13 @@ function liveBodyHtml(h, street) {
     const r = livePreview.result;
     const acts = displayActs(r);
     const maxF = Math.max(0.0001, ...acts.map(a => a.freq));
-    const bestEV = Math.max(0, ...acts.map(a => a.ev));
     let req = null;
     try { req = buildSolveReq(h, t.di); } catch (e) { req = { pot: r.pot, facingBet: 0 }; }
     const handTag = r.focus && (r.focus.cards || []).length ? ` · 频率按手牌 ${esc(r.focus.cards.join(' '))}` : '';
     // 复盘模式：历史节点策略在此行内展示；实时模式的频率/EV 已内联到下方选项卡片
     const rows = t.mode === 'review'
       ? `<div class="dp-sub">复盘 #${t.di + 1} · 当时局面（仅展示，点时间线可切换）</div>
-      <div class="live-bars">${acts.map((a, i) => `<div class="live-row ${a.ev >= bestEV - 1e-9 ? 'best' : ''}">
+      <div class="live-bars">${acts.map((a, i) => `<div class="live-row ${a.freq >= maxF - 1e-9 && a.freq > 0 ? 'best' : ''}">
         <span class="live-act">${esc(a.label || a.type)}</span>
         <div class="live-track"><i style="width:${(a.freq / maxF * 100).toFixed(0)}%;animation-delay:${(i * 40)}ms"></i></div>
         <span class="live-freq">${(a.freq * 100).toFixed(0)}%</span>
@@ -691,15 +693,16 @@ function statCtxOf(h, street, t) {
   if (!(livePreview.status === 'done' && livePreview.result && livePreview.key === key)) return null;
   const acts = displayActs(livePreview.result);
   return {
+    acts,
+    solveKey: livePreview.key,
     lookup: statLookup(acts),
-    maxF: Math.max(0.0001, ...acts.map(a => a.freq)),
-    bestEV: Math.max(0, ...acts.map(a => a.ev))
+    maxF: Math.max(0.0001, ...acts.map(a => a.freq))
   };
 }
-function acStatHtml(st, maxF, bestEV) {
+function acStatHtml(st, maxF) {
   if (!st) return '';
   const w = Math.max(4, Math.round((st.freq / (maxF || 1)) * 100));
-  const best = st.ev >= bestEV - 1e-9;
+  const best = st.freq >= maxF - 1e-9 && st.freq > 0;
   return `<span class="ac-stat ${best ? 'best' : ''}">
     <span class="ac-bar"><i style="width:${w}%"></i></span>
     <span class="ac-freq">${(st.freq * 100).toFixed(0)}%</span>
@@ -726,7 +729,7 @@ function applyStatsToCards() {
     else if (type === 'ALLIN') st = ctx.lookup.ALLIN;
     else if (type === 'FOLD') st = ctx.lookup.FOLD;
     else if (type === 'CHECK') st = ctx.lookup.CHECK;
-    if (st) btn.insertAdjacentHTML('beforeend', acStatHtml(st, ctx.maxF, ctx.bestEV));
+    if (st) btn.insertAdjacentHTML('beforeend', acStatHtml(st, ctx.maxF));
   });
 }
 /** 决策面板：节点信息 + 状态/推荐解释 + 可点击选项（频率/EV 内联）合为一体 */
@@ -752,7 +755,7 @@ function decisionPanelHtml(h, street, live, toCall, flow) {
     <div class="dp-node">${nodeLine} ${modeTag}</div>
     <div class="live-body" id="liveBodyWrap">${liveBodyHtml(h, street)}</div>
     ${t.mode === 'review' && !closed ? '<div class="dp-sub">录入当前行动（不影响上方复盘）</div>' : ''}
-    <div class="dp-cards">${cards}</div>
+    <div class="dp-cards" id="dpCards">${cards}</div>
     <div class="tiny muted" style="margin-top:6px">随每次选择即时重算（低迭代快解，仅用于交互反馈；正式结果以「开始解算」为准）。数据只读取当前录入内容，不写入也不覆盖已有数据。</div>
   </div>`;
 }
@@ -821,6 +824,20 @@ function updateLiveBody() {
     badge.className = 'live-badge ' + b.cls;
     badge.textContent = b.text;
   }
+  // 求解完成后选项档位需与推荐同源：仅在尺度来源变化时重建选项区（不打断输入焦点）
+  const dpCards = $('#dpCards'), grid = dpCards && $('#decisionCards');
+  if (dpCards && grid) {
+    const ctx = statCtxOf(h, street, liveTarget(h, street));
+    const wantKey = ctx ? ctx.solveKey : '';
+    if ((grid.dataset.solveKey || '') !== wantKey) {
+      const flow = actionFlow(h, street);
+      const closed = flow.closed && !ui.act.force;
+      const { live } = liveFor(h, street);
+      const toCall = Math.max(0, Number(live.toCall) || 0);
+      dpCards.innerHTML = closed ? streetDoneHtml(h, street, flow)
+        : actionCardsHtml(h, live, toCall, street, flow, ctx);
+    }
+  }
   applyStatsToCards();
 }
 /** 停止实时预览（进入正式求解 / 离开向导时调用），不触碰持久化数据 */
@@ -883,7 +900,7 @@ function actionCardsHtml(h, live, toCall, street, flow, statCtx = null) {
   const stat = (type, amt) => statCtx ? acStatHtml(
     type === 'BET' ? pickStat(statCtx.lookup.BET, amt) :
     type === 'RAISE_TO' ? pickStat(statCtx.lookup.RAISE, amt) :
-    statCtx.lookup[type] || null, statCtx.maxF, statCtx.bestEV) : '';
+    statCtx.lookup[type] || null, statCtx.maxF) : '';
   const out = [], notes = [];
   if (preflop && facing) {
     // 翻前面对大盲 / 加注，规则上不存在过牌；只有大盲期权（待跟注额为 0）时才出现
@@ -897,7 +914,11 @@ function actionCardsHtml(h, live, toCall, street, flow, statCtx = null) {
     const minTo = Math.max(0, Number(live.highest) || 0) + Math.max(1, Number(live.lastRaise) || 1);
     // 加注仅在有合法加注空间时提供：对手已全下 / 后手不足以最小加注时，只剩弃牌与跟注
     const canRaise = ownRem > toCall + 0.5 && allinTo + 1e-6 >= minTo;
-    if (canRaise) out.push(sizeActionCard('RAISE_TO', '加注至', `面对 ${fmt(Number(live.highest) || 0, 1)} BB · 最小加注至 ${fmt(minTo, 1)} BB`, raiseSizes(live, allinTo), false, '', stat));
+    if (canRaise) {
+      // 尺度与「为什么推荐」同源：实时预览已完成时直接用求解器动作里的加注至金额
+      const solveOpts = statCtx ? solverSizeOptions(statCtx.acts, 'RAISE', allinTo, minTo) : null;
+      out.push(sizeActionCard('RAISE_TO', '加注至', `面对 ${fmt(Number(live.highest) || 0, 1)} BB · 最小加注至 ${fmt(minTo, 1)} BB`, solveOpts || raiseSizes(live, allinTo), false, '', stat));
+    }
     else notes.push('对手已全下或你的后手不足以最小加注：当前只有「弃牌 / 跟注」两个选项。');
   } else {
     notes.push('无人下注：不提供「跟注 / 加注」；可免费过牌时「弃牌」无意义，也不提供。');
@@ -905,15 +926,17 @@ function actionCardsHtml(h, live, toCall, street, flow, statCtx = null) {
     out.push(simpleActionCard('CHECK', bbOption ? '过牌（大盲期权）' : '过牌',
       bbOption ? '无人再加注，保留大盲期权直接看翻牌' : '不投入，把行动权交给对手', false, '', stat('CHECK')));
     const betTitle = preflop ? '加注（大盲期权）' : '下注';
+    // 与加注同理：有求解结果时优先用求解器的下注尺度，保证与推荐文案一致
+    const solveBet = statCtx ? solverSizeOptions(statCtx.acts, 'BET', ownRem, 0.9) : null;
     out.push(sizeActionCard('BET', betTitle,
-      preflop ? `主动加注 · 底池 ${fmt(pot, 1)} BB，按比例给出加注额` : `主动下注 · 底池 ${fmt(pot, 1)} BB`,
-      betSizes(live, ownRem), ownRem <= 0.5, '后手不足', stat));
+      preflop ? `主动加注 · 底池 ${fmt(pot, 1)} BB，按求解尺度给出加注额` : `主动下注 · 底池 ${fmt(pot, 1)} BB，按求解尺度给出下注额`,
+      solveBet || betSizes(live, ownRem), ownRem <= 0.5, '后手不足', stat));
   }
   if (ownRem > 0.5 && (!facing || ownRem > toCall + 0.5)) {
     out.push(simpleActionCard('ALLIN', `全下 ${fmt(allinTo, 1)}`,
       `投入全部后手 ${fmt(ownRem, 1)} BB（本街总投入 ${fmt(allinTo, 1)} BB）`, false, '', stat('ALLIN'), allinTo));
   }
-  return `<div class="ac-grid" id="decisionCards">${out.join('')}</div>
+  return `<div class="ac-grid" id="decisionCards" data-solve-key="${statCtx ? esc(statCtx.solveKey) : ''}">${out.join('')}</div>
     ${notes.map(n => `<div class="ac-note">${esc(n)}</div>`).join('')}
     ${ui.act.force ? `<div class="notice" style="margin-top:8px">手动补录模式：当前行动者 <b>${esc(nextActorFor(h, street) || '—')}</b>。
       <button class="btn sm" data-act="cancelForce">恢复自动顺位</button></div>` : ''}`;

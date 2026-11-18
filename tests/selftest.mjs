@@ -541,5 +541,36 @@ Turn: [QdTd3h5s]  BB check, BTN bet 58.0`;
   ok('正常跟注无全下后缀', !!c3 && /^跟注 9\.0 BB$/.test(c3.label), c3 && c3.label);
 }
 
+console.log('\n[13] 求解尺度与推荐文案同源（V1.11：加注至选项匹配推荐）');
+{
+  const { solverSizeOptions } = await import('../js/ui-sizes.js');
+  // 用户反馈局面：推荐「加注至 11.1 BB」/「加注至 23.9 BB」，旧规则档位不含这两个金额
+  const acts = [
+    { type: 'FOLD', sizeBB: null, label: '弃牌', freq: 0.05, ev: -4.8 },
+    { type: 'CALL', sizeBB: 4.8, label: '跟注 4.8 BB', freq: 0.10, ev: 1.2 },
+    { type: 'RAISE', sizeBB: 11.1, label: '加注至 11.1 BB', freq: 0.85, ev: 5.93 },
+    { type: 'RAISE', sizeBB: 23.9, label: '加注至 23.9 BB', freq: 0.10, ev: 6.69 },
+    { type: 'ALLIN', sizeBB: 42.8, label: '全下 42.8 BB', freq: 0.05, ev: 5.1 }
+  ];
+  const raises = solverSizeOptions(acts, 'RAISE', 42.8, 9.6);
+  ok('加注档位包含推荐 11.1 BB', raises.some(o => Math.abs(o.amt - 11.1) < 0.05), JSON.stringify(raises));
+  ok('加注档位包含次优 23.9 BB', raises.some(o => Math.abs(o.amt - 23.9) < 0.05), JSON.stringify(raises));
+  ok('档位金额与求解动作完全一致（不再用最小加注/2×/3×）', raises.every(o => acts.some(a => a.type === 'RAISE' && Math.abs(a.sizeBB - o.amt) < 0.05)), JSON.stringify(raises));
+  ok('档位按金额升序且去重', raises.every((o, i) => i === 0 || o.amt > raises[i - 1].amt), JSON.stringify(raises));
+  ok('超后手金额被过滤', solverSizeOptions([{ type: 'RAISE', sizeBB: 50 }], 'RAISE', 42.8, 9.6) === null);
+  ok('低于最小加注的金额被过滤', solverSizeOptions([{ type: 'RAISE', sizeBB: 8 }], 'RAISE', 42.8, 9.6) === null);
+  ok('无求解动作时返回 null（触发规则档兜底）', solverSizeOptions([{ type: 'FOLD' }], 'RAISE', 42.8, 9.6) === null);
+  ok('空输入返回 null', solverSizeOptions(null, 'RAISE', 42.8, 9.6) === null && solverSizeOptions([], 'BET', 42.8, 0) === null);
+  const bets = solverSizeOptions([
+    { type: 'BET', sizeBB: 3.3, label: '下注 3.3 BB', freq: 0.6, ev: 2.1 },
+    { type: 'BET', sizeBB: 6.6, label: '下注 6.6 BB', freq: 0.4, ev: 2.0 },
+    { type: 'CHECK', sizeBB: null, label: '过牌', freq: 0.0, ev: 0 }
+  ], 'BET', 42.8, 0.9);
+  ok('下注档位同样取自求解动作', bets.length === 2 && Math.abs(bets[0].amt - 3.3) < 0.05 && Math.abs(bets[1].amt - 6.6) < 0.05, JSON.stringify(bets));
+  ok('求解档位带来源标签「均衡档」', raises.every(o => o.label === '均衡档') && bets.every(o => o.label === '均衡档'));
+  ok('重复金额去重', solverSizeOptions([{ type: 'RAISE', sizeBB: 11.1 }, { type: 'RAISE', sizeBB: 11.1 }], 'RAISE', 42.8, 9.6).length === 1);
+  ok('金额四舍五入到 0.1 BB', solverSizeOptions([{ type: 'RAISE', sizeBB: 11.06 }], 'RAISE', 42.8, 9.6)[0].amt === 11.1);
+}
+
 console.log(`\n结果：${pass} 通过 / ${fail} 失败\n`);
 if (fail) process.exit(1);
