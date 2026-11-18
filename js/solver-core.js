@@ -367,26 +367,89 @@ function dealLoop(ctx, root, fn) {
   }
   return weight > 0 ? total / weight : 0;
 }
-/* 迭代口径（V1.8）：1 次迭代 = 1 次 CFR 遍历（遍历 1 组 Hero/Villain 牌力档组合），
- * 与 PioSolver 等商业解算器的 iteration 口径一致。界面显示的次数 = 实际执行的遍历次数。 */
-export const SOLVE_ITER = { fast: 100000, precise: 500000 };
-function runCFR(ctx, root, onProgress, label) {
+/* 停止指标（V1.14）：以可剥削度 exploitability / NashConv（mbb/hand）为准，迭代次数只是预算上限与辅助信息。
+ * 口径参考 CFR+/MCCFR 与 PioSolver / GTOWizard：教学 <50 mbb；日常可靠 <1 mbb；精细大树 <0.5 mbb。
+ * 本实现是 10 档牌力抽象的近似模型，存在抽象下限（实测约 7 mbb），达不到目标时如实提示，不伪造达标。 */
+export const CONVERGENCE_TARGETS = {
+  teaching: {
+    id: 'teaching', label: '教学 / 粗略复盘', targetMbb: 50, maxIterations: 20000,
+    hint: '目标 <50 mbb/hand：只看大方向，混合频率误差大，不适合抠价值/诈唬比例。CFR+ 通常 5k～20k 迭代。'
+  },
+  daily: {
+    id: 'daily', label: '日常可靠复盘（对标 PioSolver）', targetMbb: 1, maxIterations: 500000,
+    hint: '目标 <1 mbb/hand：可用于学习复盘、价值/诈唬比例与范围笔记。单街/两街且尺度较少约 10 万～50 万迭代；三街、多尺度或深码大树需更多。'
+  },
+  fine: {
+    id: 'fine', label: '精细 / 三街大树深码', targetMbb: 0.5, maxIterations: 1000000,
+    hint: '目标 <0.5 mbb/hand：100 万次迭代预算，适合三街、多下注尺寸、深码大树，耗时较长。'
+  }
+};
+export const SOLVE_ITER = { fast: 100000, precise: 500000 }; // 兼容旧调用：仅作为预算别名，不再作为「有效性」判据
+
+/** 解析收敛配置：targetMbb 为停止指标，maxIterations 仅为预算上限。显式 iterations（预览/测试）只收紧预算。 */
+export function resolveConvergence(req = {}) {
+  const q = CONVERGENCE_TARGETS[req.quality] ? req.quality : 'daily';
+  const t = CONVERGENCE_TARGETS[q];
+  const rawTarget = Number(req.targetMbb);
+  const targetMbb = Number.isFinite(rawTarget) && rawTarget > 0 ? rawTarget : t.targetMbb;
+  const rawIter = Number(req.iterations);
+  const maxIterations = Number.isFinite(rawIter) && rawIter > 0 ? Math.floor(rawIter) : t.maxIterations;
+  return { quality: q, targetMbb, maxIterations, label: t.label, hint: t.hint };
+}
+
+/** 当前平均策略的可剥削度 NashConv = max(0, BR_H - Eq) + max(0, Eq - BR_V)，单位 mbb/hand */
+function measureNashConv(ctx, root) {
+  const heroStrat = (s, b, acts) => avgStrat(ctx.nodes.get(s.key), 'hero', b, acts.length);
+  const villainStrat = (s, b, acts) => avgStrat(ctx.nodes.get(s.key), 'villain', b, acts.length);
+  const eqEV = dealLoop(ctx, root, (bh, bv, pD) => evaluate(root, bh, bv, pD, ctx, { heroStrat, villainStrat }));
+  const brHero = heroBRValue(root, ctx, villainStrat);
+  const brVillain = villainBRValue(root, ctx, heroStrat);
+  // 与正式结果同一口径：max(0, BR_H - Eq) + max(0, Eq - BR_V)。
+  // 近似模型个别局面会出现 BR 顺序反转得到 0，调用方必须把 0 视为「测量下限」而非达标。
+  const gainH = Math.max(0, brHero - eqEV), gainV = Math.max(0, eqEV - brVillain);
+  return Math.round((gainH + gainV) * 1000 * 10) / 10;
+}
+
+function runCFR(ctx, root, onProgress, label, conv = null) {
   const { pH, pV } = ctx;
   const pairs = [];
   for (let bh = 0; bh < ctx.NB; bh++) for (let bv = 0; bv < ctx.NB; bv++) {
     const pD = pH[bh] * pV[bv];
     if (pD > 0) pairs.push([bh, bv, pD]);
   }
-  if (!pairs.length) return 0;
+  if (!pairs.length) return { iterations: 0, exploitabilityMbb: null, converged: false, targetMbb: conv ? conv.targetMbb : null };
   const iters = Math.max(1, Math.floor(ctx.iterations) || 0);
   const step = Math.max(10, Math.floor(iters / 120));
+  // 检查点对齐「一轮完整牌力档扫描」，避免半轮采样造成的 NashConv 假震荡
+  const checkEvery = conv
+    ? Math.max(pairs.length, Math.ceil(Math.max(pairs.length, Math.floor(iters / 24)) / pairs.length) * pairs.length)
+    : Infinity;
+  // 采样式 CFR 的单次 NashConv 会震荡（偶发 0 值），必须用 3 点滑动窗口 + 连续达标 + 最小迭代门槛防误判
+  const history = [];
+  const minIters = Math.min(Math.floor(iters * 0.1), 5000);
+  let lastMbb = null, converged = false, ran = 0;
   for (let it = 0; it < iters; it++) {
     if (ctx.cancelled) throw new Error('CANCELLED');
     const pr = pairs[it % pairs.length]; // 轮转覆盖全部牌力档组合，等价于按序全量扫描
     cfr(root, pr[0], pr[1], 1, 1, pr[2], ctx);
-    if (onProgress && (it % step === 0 || it === iters - 1)) onProgress((it + 1) / iters, label);
+    ran = it + 1;
+    if (conv && ran % checkEvery === 0) {
+      history.push(measureNashConv(ctx, root));
+      if (history.length > 3) history.shift();
+      lastMbb = Math.round(history.reduce((a, b) => a + b, 0) / history.length * 10) / 10;
+      if (ran >= minIters && history.length >= 3 && history.every(x => x > 0 && x <= conv.targetMbb)) converged = true;
+    }
+    if (onProgress && (it % step === 0 || ran === iters || converged)) {
+      onProgress(ran / iters, label, {
+        iterations: ran, exploitabilityMbb: lastMbb,
+        targetMbb: conv ? conv.targetMbb : null, converged
+      });
+    }
+    if (converged) break;
   }
-  return iters; // 实际执行的迭代次数（用于界面统计，保证显示与执行一致）
+  if (conv && lastMbb == null) lastMbb = measureNashConv(ctx, root);
+  // 实际执行的迭代次数（界面显示为「辅助信息」，有效性只看 exploitabilityMbb）
+  return { iterations: ran, exploitabilityMbb: lastMbb, converged, targetMbb: conv ? conv.targetMbb : null };
 }
 function heatFor(ctx, root, heroCombos, hb, villainCombos, vb, who) {
   const heat = Array.from({ length: 13 }, () => new Array(13).fill(0));
@@ -435,9 +498,9 @@ export function solveCore(req, onProgress = () => {}) {
   if (board.length === 1 || board.length === 2) throw new Error('公共牌需为 0 张（翻前）或 3–5 张（翻后）；当前 1–2 张无法求解');
   const phase = board.length === 0 ? 'preflop' : 'postflop';
   if ((req.sizes || []).length > 4) throw new Error('每街下注尺度最多 4 个，请压缩尺度集合');
-  // 正式求解（未显式指定迭代数）按档位默认，且至少 10,000 次；显式 iterations 仅供预览/测试
-  const iterations = Math.max(1, Math.floor(req.iterations) || (req.preset === 'precise' ? SOLVE_ITER.precise : SOLVE_ITER.fast));
-  const ctx = makeCtx(req, iterations);
+  // 停止指标 = 可剥削度目标；迭代次数仅为预算上限（显式 iterations 用于实时预览/测试收紧预算）
+  const conv = resolveConvergence(req);
+  const ctx = makeCtx(req, conv.maxIterations);
   const root = makeRoot(req);
   const treeSize = countTree(ctx, root);
   if (treeSize > 600) throw new Error('分支过大：请压缩下注尺度集合或收窄对手范围后重试');
@@ -487,8 +550,9 @@ export function solveCore(req, onProgress = () => {}) {
   for (let b = 0; b < N_BUCKETS; b++) { pH[b] /= heroCombos.length; pV[b] /= villainCombos.length; }
   ctx.pH = pH; ctx.pV = pV;
 
-  onProgress(0.18, '求解均衡策略');
-  const itersRun = runCFR(ctx, root, (p) => onProgress(0.18 + p * 0.62, '求解均衡策略'), 'gto');
+  onProgress(0.18, '求解均衡策略', { iterations: 0, exploitabilityMbb: null, targetMbb: conv.targetMbb, converged: false });
+  const gtoRun = runCFR(ctx, root, (p, l, info) => onProgress(0.18 + p * 0.62, l, info), 'gto', conv);
+  const itersRun = gtoRun.iterations;
 
   const rootActs = actionList(root, ctx);
   const avgHero = (state, bucket, acts, c) => avgStrat(c.nodes.get(state.key), 'hero', bucket, acts.length);
@@ -497,7 +561,9 @@ export function solveCore(req, onProgress = () => {}) {
   const brHero = heroBRValue(root, ctx, avgVillain);
   const brVillain = villainBRValue(root, ctx, avgHero);
   const gainH = Math.max(0, brHero - eqEV), gainV = Math.max(0, eqEV - brVillain);
-  const exploitabilityMbb = Math.max(0, Math.round((gainH + gainV) * 1000 * 10) / 10);
+  // 以 CFR 过程中最后一次 NashConv 测量为准（达标提前停止时与最终策略一致），避免口径漂移
+  const exploitabilityMbb = gtoRun.exploitabilityMbb != null
+    ? gtoRun.exploitabilityMbb : Math.max(0, Math.round((gainH + gainV) * 1000 * 10) / 10);
 
   const rootNode = ctx.nodes.get('');
   const gtoFreq = new Array(rootActs.length).fill(0);
@@ -513,6 +579,8 @@ export function solveCore(req, onProgress = () => {}) {
 
   const base = {
     mode: 'gto', archetype: null, phase, boardCount: board.length,
+    quality: conv.quality, targetMbb: conv.targetMbb, converged: gtoRun.converged,
+    maxIterations: conv.maxIterations,
     decisionNode: req.decisionNode || (phase === 'preflop' ? 'PREFLOP|HERO' : 'FLOP|HERO'),
     pot: Math.round(req.pot * 10) / 10, stacks: Math.round(req.stack * 10) / 10,
     actions: rootActs.map((a, i) => ({ type: a.type, sizeBB: a.raiseTo != null ? a.raiseTo : (a.amount != null ? a.amount : null), label: a.label, freq: gtoFreqRounded[i], ev: Math.round(gtoEV[i] * 100) / 100 })),
@@ -544,7 +612,9 @@ export function solveCore(req, onProgress = () => {}) {
   const exp = makeCtx(req, Math.max(8000, Math.round(itersRun * 0.6)));
   exp.E = ctx.E; exp.pH = pH; exp.pV = pV; exp.locked = true; exp.baseNodes = ctx.nodes;
   const expRoot = makeRoot(req);
-  const expItersRun = runCFR(exp, expRoot, (p) => onProgress(0.83 + p * 0.15, '节点锁定并求解剥削路线'), 'exploit');
+  const expItersRun = runCFR(exp, expRoot, (p, l, info) => onProgress(0.83 + p * 0.15, l, {
+    ...info, exploitabilityMbb, targetMbb: conv.targetMbb, converged: gtoRun.converged
+  }), 'exploit').iterations;
 
   const expHeroStrat = (state, bucket, acts) => avgStrat(exp.nodes.get(state.key), 'hero', bucket, acts.length);
   const gtoVsLocked = dealLoop(ctx, root, (bh, bv, pD) => evaluate(root, bh, bv, pD, ctx, { heroStrat: avgHero, villainStrat: lockedProvider }));
@@ -567,6 +637,8 @@ export function solveCore(req, onProgress = () => {}) {
   return {
     ...base, mode: 'exploit', archetype: req.archetype, intensity: ctx.intensity,
     exploitGainBB, archetypeLabel: (req.archetype || '').toUpperCase(),
+    // 剥削路线本身不是均衡，NashConv 无意义；保留 GTO 基线值供 UI 标注「均衡参考可剥削度」
+    exploitabilityMbb, nashConvScope: 'gto-reference',
     // 剥削路线也要给出「你的手牌」条件策略，否则结果页仍显示 GTO 档位
     focus: focusStrategy(req, expRootNode, rootActs, heroCombos, hb, heroEq, pH) || base.focus,
     iterationsExploit: expItersRun,
@@ -574,7 +646,6 @@ export function solveCore(req, onProgress = () => {}) {
     evLossBB: expUserLoss,
     gtoActions: base.actions,
     gtoEvLossBB: base.evLossBB,
-    exploitabilityMbb: null,
     lockedInfo: { params: ARCHETYPE_PARAMS[req.archetype] || ARCHETYPE_PARAMS.tag, widthApplied: true, rangeClamped: req.villainRangeLocked === true },
     durationMs: Date.now() - t0
   };

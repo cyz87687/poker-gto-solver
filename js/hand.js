@@ -28,7 +28,7 @@ export function defaultHand() {
     actions: [], result: null, stackBB: 100, potBB: null,
     ranges: { hero: presetMatrix('btn'), villain: presetMatrix('bb') },
     rangePresets: { hero: 'btn', villain: 'bb' },
-    sizes: [0.33, 0.67, 1], allowCheckRaise: true, preset: 'fast',
+    sizes: [0.33, 0.67, 1], allowCheckRaise: true, preset: 'fast', quality: 'daily',
     mode: 'gto', archetype: 'tag', intensity: 1,
     tags: [], favorite: false, note: '', solvedJobId: null
   };

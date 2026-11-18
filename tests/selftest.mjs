@@ -9,10 +9,10 @@ import {
   postflopOrder, firstToActPostflop, heroIsOOP, solveReadiness,
   stageFromBoard, stageBoardCount, actionFlow
 } from '../js/hand.js';
-import { solveCore, previewCore, ARCHETYPE_PARAMS } from '../js/solver-core.js';
+import { solveCore, previewCore, ARCHETYPE_PARAMS, resolveConvergence, CONVERGENCE_TARGETS } from '../js/solver-core.js';
 import {
   initDB, state, commit, upsertSession, upsertHand, sessionNet, computeStats,
-  escapeHtml, exportJSON, importJSON, exportSessionsCSV
+  escapeHtml, exportJSON, importJSON, exportSessionsCSV, jobCacheKey
 } from '../js/db.js';
 import { rangesForDecision, preflopRaiseLevel, raiseLevelFraction, narrowRangeTop, applyArchetypeToRange } from '../js/range-by-action.js';
 
@@ -680,6 +680,39 @@ console.log('\n[15] V1.13 审查缺陷修复（手牌条件频率 / 画像范围
   const hBlind = parseHH(hhAK).hand, sBlind = deriveState(hBlind, 0);
   ok('Hero 为 BB 时后手 99 / 对手 SB 后手 99.5', near(sBlind.rem.hero, 99) && near(sBlind.rem.villain, 99.5), JSON.stringify(sBlind.rem));
   ok('盲注计入总投入且底池自洽', near(sBlind.totalInvest.hero, 1) && near(sBlind.totalInvest.villain, 0.5) && near(sBlind.pot, 1.5), JSON.stringify(sBlind.totalInvest));
+}
+
+console.log('\n[16] V1.14 收敛停止指标（NashConv，而非固定迭代次数）');
+{
+  ok('三档目标与预算齐备', CONVERGENCE_TARGETS.teaching.targetMbb === 50 && CONVERGENCE_TARGETS.daily.targetMbb === 1
+    && CONVERGENCE_TARGETS.fine.targetMbb === 0.5 && CONVERGENCE_TARGETS.daily.maxIterations === 500000);
+  ok('默认档为日常可靠 <1 mbb', resolveConvergence({}).quality === 'daily' && resolveConvergence({}).targetMbb === 1);
+  ok('显式 targetMbb 覆盖档位目标', resolveConvergence({ quality: 'teaching', targetMbb: 200 }).targetMbb === 200);
+  const rc = resolveConvergence({ quality: 'teaching', iterations: 15000 });
+  ok('显式 iterations 只收紧预算、不改目标', rc.maxIterations === 15000 && rc.targetMbb === 50);
+
+  const h = parseHH(HH_EXAMPLE).hand, idx = heroDecisionIndices(h)[0], st = deriveState(h, idx);
+  const req = {
+    board: st.board, heroCards: h.heroCards, villainCards: [], deadCards: [],
+    heroRange: presetMatrix('btn'), villainRange: presetMatrix('bb'),
+    pot: 10, stack: 90, facingBet: 0, heroOOP: false, oppChecked: true,
+    sizes: h.sizes, allowCheckRaise: true, preset: 'fast', mode: 'gto', userAction: null
+  };
+  const infos = [];
+  const rT = solveCore({ ...req, quality: 'teaching' }, (p, l, info) => { if (info) infos.push(info); });
+  ok('教学档达到 <50 mbb 后提前停止', rT.converged === true && rT.exploitabilityMbb <= 50 && rT.iterations < rT.maxIterations,
+    rT.exploitabilityMbb + ' mbb @ ' + rT.iterations + '/' + rT.maxIterations);
+  ok('停止判据是可剥削度而非固定迭代', rT.iterations !== 20000 && rT.targetMbb === 50);
+  ok('进度回调携带可剥削度与目标', infos.length > 0 && infos[infos.length - 1].exploitabilityMbb === rT.exploitabilityMbb && infos[infos.length - 1].targetMbb === 50);
+  ok('结果含收敛档位与迭代预算', rT.quality === 'teaching' && rT.maxIterations === 20000 && Number.isFinite(rT.exploitabilityMbb));
+
+  const rEarly = solveCore({ ...req, quality: 'daily', targetMbb: 200, iterations: 20000 });
+  ok('放宽目标后更早停止', rEarly.converged && rEarly.iterations < rT.iterations, rEarly.iterations + ' < ' + rT.iterations);
+  const rUnmet = solveCore({ ...req, quality: 'daily', targetMbb: 1, iterations: 8000 });
+  ok('未达标时如实标记、不伪造收敛', rUnmet.converged === false && rUnmet.exploitabilityMbb > 1, rUnmet.exploitabilityMbb + ' mbb');
+  const rExp = solveCore({ ...req, quality: 'teaching', mode: 'exploit', archetype: 'lag', intensity: 1 });
+  ok('剥削模式保留 GTO 基线可剥削度并标注口径', rExp.exploitabilityMbb != null && rExp.nashConvScope === 'gto-reference' && rExp.targetMbb === 50);
+  ok('收敛档位纳入求解缓存键', jobCacheKey(h, { quality: 'teaching', decisionIndex: idx }) !== jobCacheKey(h, { quality: 'daily', decisionIndex: idx }));
 }
 
 console.log(`\n结果：${pass} 通过 / ${fail} 失败\n`);

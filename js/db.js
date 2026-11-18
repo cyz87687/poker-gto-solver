@@ -2,6 +2,7 @@
  * IndexedDB 为主存储，localStorage 作镜像与降级（file:// / 隐私模式）。
  */
 import { BUILTIN_TAGS, handProfitBB, handClass, serializeHH, actorSide } from './hand.js';
+import { CONVERGENCE_TARGETS } from './solver-core.js';
 
 const DB_NAME = 'poker_gto_review';
 const STORE = 'kv';
@@ -125,14 +126,19 @@ export function upsertJob(job) {
     return job;
   });
 }
-/* 求解器版本令牌：迭代口径/预算变更时递增，仅使旧缓存不再命中（旧 job 数据保留不动） */
-const SOLVER_REV = 'v1.13';
+/* 求解器版本令牌：停止指标/缓存参数变更时递增，仅使旧缓存不再命中（旧 job 数据保留不动） */
+const SOLVER_REV = 'v1.14';
+/* V1.14：收敛档位纳入缓存键，不同可剥削度目标不得复用旧结果；老数据缺字段时按 daily 兜底 */
+function cacheParams(hand, params) {
+  return [hand.id, params.mode, params.archetype, params.intensity, params.sizes, params.pot, params.stack,
+    params.decisionIndex, params.preset, params.quality || 'daily', params.targetMbb || CONVERGENCE_TARGETS.daily.targetMbb, SOLVER_REV];
+}
 export function findCachedJob(hand, params) {
-  const key = JSON.stringify([hand.id, params.mode, params.archetype, params.intensity, params.sizes, params.pot, params.stack, params.decisionIndex, params.preset, SOLVER_REV]);
+  const key = JSON.stringify(cacheParams(hand, params));
   return state().jobs.find(j => j.cacheKey === key && j.status === 'done' && j.result) || null;
 }
 export function jobCacheKey(hand, params) {
-  return JSON.stringify([hand.id, params.mode, params.archetype, params.intensity, params.sizes, params.pot, params.stack, params.decisionIndex, params.preset, SOLVER_REV]);
+  return JSON.stringify(cacheParams(hand, params));
 }
 
 /* ---------------- 工具 ---------------- */

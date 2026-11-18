@@ -12,7 +12,7 @@ import {
   computeStats, sessionNet, sessionBuyin, exportJSON, importJSON, exportSessionsCSV, exportHandHH, downloadText
 } from './db.js';
 import { drawCurve, drawBars, renderHeatmapGrid, buildResultImage } from './charts.js';
-import { solveCore, SOLVE_ITER } from './solver-core.js';
+import { solveCore, SOLVE_ITER, CONVERGENCE_TARGETS } from './solver-core.js';
 import { solverSizeOptions } from './ui-sizes.js';
 import { rangesForDecision } from './range-by-action.js';
 
@@ -32,6 +32,8 @@ let previewResult = null;
 let toastTimer = null;
 // 实时预览：纯内存态，不写入任何持久化数据。数据保护：只读 hand，绝不修改/删除已录入内容。
 let livePreview = { key: '', status: 'idle', result: null, pct: 0, error: '' };
+// 已受理的剥削画像指纹：切换模式/画像/强度后须点「确认并重新解算」才受理，其他参数仍自动重算
+let liveProfilePart = '';
 let livePreviewSeq = 0;
 let livePreviewTimer = null;
 let livePreviewWorker = null;
@@ -99,8 +101,9 @@ class SolverQueue {
       w.onmessage = ev => {
         const m = ev.data || {};
         if (m.type === 'progress') {
-          if (item.persist) upsertJob({ id: item.jobId, progress: m.pct, progressLabel: m.label, etaMs: m.etaMs });
-          item.handlers.onProgress && item.handlers.onProgress(m.pct, m.label, m.etaMs);
+          const conv = { exploitabilityMbb: m.exploitabilityMbb, targetMbb: m.targetMbb, converged: m.converged, iterations: m.iterations };
+          if (item.persist) upsertJob({ id: item.jobId, progress: m.pct, progressLabel: m.label, etaMs: m.etaMs, ...conv });
+          item.handlers.onProgress && item.handlers.onProgress(m.pct, m.label, m.etaMs, conv);
         } else if (m.type === 'result') {
           if (item.persist) upsertJob({ id: item.jobId, status: 'done', progress: 1, result: m.result });
           this.finish(item); item.handlers.onResult && item.handlers.onResult(m.result);
@@ -118,7 +121,7 @@ class SolverQueue {
         toast('当前环境不支持 Web Worker，已切换为主线程慢速求解');
         const r = item.type === 'preview'
           ? (awaitPreview(item))
-          : solveCore(item.req, (p, l) => { item.handlers.onProgress && item.handlers.onProgress(p, l, null); });
+          : solveCore(item.req, (p, l, info) => { item.handlers.onProgress && item.handlers.onProgress(p, l, null, info); });
         if (item.type === 'preview') { this.finish(item); item.handlers.onPreview && item.handlers.onPreview(r); }
         else {
           if (item.persist) upsertJob({ id: item.jobId, status: 'done', progress: 1, result: r });
@@ -179,6 +182,7 @@ function buildSolveReq(h, decisionIndex) {
     pot, stack, facingBet, heroOOP: st.heroOOP, oppChecked,
     sizes: h.sizes, allowCheckRaise: h.allowCheckRaise, preset: h.preset,
     mode: h.mode, archetype: h.archetype, intensity: h.intensity,
+    quality: h.quality || 'daily', targetMbb: h.targetMbb || null,
     userAction: act ? { type: act.type, amountBB: act.amountBB } : null,
     decisionNode: `${stage}|${h.positions.hero}|${facingBet > 0 ? 'vs_bet' : 'vs_check'}`,
     decisionIndex, stage
@@ -203,7 +207,7 @@ function submitSolve(h, decisionIndex) {
   if (!v.solveAllowed) { openReadiness(rd); return; }
   upsertHand(h);
   const req = buildSolveReq(h, decisionIndex);
-  const params = { mode: h.mode, archetype: h.archetype, intensity: h.intensity, sizes: h.sizes, pot: req.pot, stack: req.stack, decisionIndex, preset: h.preset };
+  const params = { mode: h.mode, archetype: h.archetype, intensity: h.intensity, sizes: h.sizes, pot: req.pot, stack: req.stack, decisionIndex, preset: h.preset, quality: h.quality || 'daily', targetMbb: h.targetMbb || null };
   const key = jobCacheKey(h, params);
   const cached = findCachedJob(h, params);
   if (cached) { toast('命中求解缓存，直接打开结果'); go('result/' + cached.id); return; }
@@ -218,18 +222,40 @@ function submitSolve(h, decisionIndex) {
   queue.submit({
     jobId: job.id, req, type: 'solve', persist: true,
     handlers: {
-      onProgress: (pct, label, eta) => { if (routeInfo().name === 'result') renderProgress(job.id, pct, label, eta); },
+      onProgress: (pct, label, eta, info) => { if (routeInfo().name === 'result') renderProgress(job.id, pct, label, eta, info); },
       onResult: () => { if (routeInfo().name === 'result') render(); },
       onError: msg => { toast('求解失败：' + msg); if (routeInfo().name === 'result') render(); }
     }
   });
 }
-function renderProgress(jobId, pct, label, eta) {
+/** 收敛信息块：可剥削度为主指标，迭代次数仅辅助；mbb 单位明确标注 */
+function convHtml(info, pct, label, eta) {
+  const m = info || {};
+  const val = m.exploitabilityMbb, target = m.targetMbb;
+  // 0 是近似模型的测量下限（BR 顺序偶发反转被 clamp），不得视为达标
+  const invalid = val === 0;
+  const reached = !!m.converged || (val > 0 && target != null && val <= target);
+  const targetText = target != null ? (target < 1 ? fmt(target, 1) : String(Math.round(target))) : '—';
+  const status = invalid
+    ? '<span class="conv-run">≈0 为近似模型测量下限，无法可靠判定收敛</span>'
+    : reached
+      ? '<span class="conv-ok">✓ 已达到目标，可停止</span>'
+      : val != null ? '<span class="conv-run">尚未达标，继续收敛中</span>' : '<span class="conv-run">正在计算可剥削度…</span>';
+  return `<div class="conv-box">
+    <div class="conv-main"><span class="conv-label">可剥削度 NashConv</span>
+      <b class="conv-val" id="convVal">${val == null ? '计算中' : (invalid ? '≈0' : fmt(val, 1))}</b><span class="conv-unit">mbb/hand</span></div>
+    <div class="conv-meta">目标 <b>&lt; ${targetText}</b> mbb/hand · mbb = 千分之一大盲 / 手 · 迭代 ${m.iterations != null ? Number(m.iterations).toLocaleString('en-US') : '—'}（辅助信息）</div>
+    <div class="conv-status">${status}</div>
+    <div class="row between" style="margin-top:7px"><span class="small">${esc(label || '求解中')}</span>
+      <span class="small mono">${(pct * 100).toFixed(0)}%${eta ? ' · 预计剩余 ' + Math.ceil(eta / 1000) + 's' : ''}</span></div>
+    <div class="progress" style="margin-top:6px"><i style="width:${Math.round(pct * 100)}%"></i></div>
+  </div>`;
+}
+function renderProgress(jobId, pct, label, eta, info) {
   const box = $('#solveProgress');
   if (!box) { if (routeInfo().id === jobId) render(); return; }
-  box.innerHTML = `<div class="row between"><span class="small">${esc(label || '求解中')}</span><span class="small mono">${(pct * 100).toFixed(0)}%${eta ? ' · 预计剩余 ' + Math.ceil(eta / 1000) + 's' : ''}</span></div>
-    <div class="progress" style="margin-top:6px"><i style="width:${Math.round(pct * 100)}%"></i></div>
-    <div class="row end" style="margin-top:8px"><button class="btn sm" data-act="cancelJob" data-id="${esc(jobId)}">取消任务</button></div>`;
+  box.innerHTML = convHtml(info, pct, label, eta)
+    + `<div class="row end" style="margin-top:8px"><button class="btn sm" data-act="cancelJob" data-id="${esc(jobId)}">取消任务</button></div>`;
 }
 
 /* ---------------- 工作台 ---------------- */
@@ -605,6 +631,11 @@ function liveWhyHtml(r, req, actsIn = null) {
   };
   if (whyMap[rec.type]) lines.push(`主要判断依据：${whyMap[rec.type]}。`);
   if (req && req.rangeNote) lines.push(`范围口径：${esc(req.rangeNote)}。`);
+  if (req && req.mode === 'exploit') {
+    const A = r && r.archetype ? ARCHETYPES.find(a => a.id === r.archetype) : null;
+    const lv = Number(r && r.intensity) === 0.5 ? '轻度' : Number(r && r.intensity) === 1.5 ? '重度' : '中度';
+    lines.push(`剥削口径：对手画像 ${esc(A ? A.name + ' ' + A.tag : (r && r.archetype) || '—')} · ${lv}（节点锁定后求 Hero 最优应对）。`);
+  }
   const allinSize = rec.type === 'ALLIN' ? Number(rec.sizeBB != null ? rec.sizeBB : (Number(req.stack) || 0) + toCall) : 0;
   if (allinSize > pot * 2 && (Number(req.stack) || 0) >= 150) {
     lines.push(`风险提示：全下 ${fmt(allinSize, 1)} BB 超过底池 2 倍且属深码，需对手大量弃牌才成立；模型为近似结果，实盘慎用。`);
@@ -630,11 +661,21 @@ function liveBodyHtml(h, street) {
       <div class="tiny muted" style="padding:0 2px 8px">当前没有实时决策；点时间线中 Hero 的动作可复盘当时的策略。</div>`;
   }
   const done = livePreview.status === 'done' && livePreview.result && livePreview.key === key;
+  if (livePreview.status === 'confirm' && livePreview.key === key) {
+    const A = ARCHETYPES.find(a => a.id === h.archetype);
+    const level = Number(h.intensity) === 0.5 ? '轻度' : Number(h.intensity) === 1.5 ? '重度' : '中度';
+    return `<div class="live-confirm">
+      <div class="live-msg">剥削画像已变更：${esc(h.mode === 'exploit' ? (A ? A.name + ' ' + A.tag : h.archetype) + ' · ' + level : h.mode)}。尚未重新求解。</div>
+      <button class="btn primary" data-act="confirmExploit">确认并重新解算</button>
+      <div class="tiny muted" style="margin-top:6px">为避免仅切换模式就自动重算，需你确认后才按新画像求解；确认前不显示任何旧频率与旧 EV。</div>
+    </div>`;
+  }
   if (livePreview.status === 'error' && livePreview.key === key) {
     return `<div class="live-msg err">预览不可用：${esc(livePreview.error)}（不影响正式解算）</div>`;
   }
   if (!done && (livePreview.status === 'solving' || livePreview.status === 'queued') && livePreview.key === key) {
     return `<div class="live-msg"><span class="live-spin"></span> 正在计算实时策略 · ${Math.round(livePreview.pct * 100)}%</div>
+      <div class="tiny muted" style="padding:0 2px 4px">可剥削度 ${livePreview.mbb != null ? fmt(livePreview.mbb, 1) : '计算中'} / 目标 &lt;${livePreview.target != null ? livePreview.target : 50} mbb/hand（教学档）</div>
       <div class="progress" style="margin-top:6px"><i style="width:${(livePreview.pct * 100).toFixed(0)}%"></i></div>`;
   }
   if (done) {
@@ -666,7 +707,7 @@ function liveBodyHtml(h, street) {
 function liveBadgeHtml(key) {
   if (key === 'waiting') return { cls: 'waiting', text: '等对手' };
   if (key === 'closed') return { cls: 'closed', text: '已收口' };
-  const map = { idle: '待命', queued: '排队', solving: '求解中', done: '已就绪', error: '不可用', unsupported: '停用' };
+  const map = { idle: '待命', queued: '排队', solving: '求解中', done: '已就绪', confirm: '待确认', error: '不可用', unsupported: '停用' };
   return { cls: livePreview.status, text: map[livePreview.status] || livePreview.status };
 }
 /* ---------- 决策面板（V1.10：实时策略预览与操作选项合二为一） ---------- */
@@ -765,7 +806,7 @@ function decisionPanelHtml(h, street, live, toCall, flow) {
     <div class="live-body" id="liveBodyWrap">${liveBodyHtml(h, street)}</div>
     ${t.mode === 'review' && !closed ? '<div class="dp-sub">录入当前行动（不影响上方复盘）</div>' : ''}
     <div class="dp-cards" id="dpCards">${cards}</div>
-    <div class="tiny muted" style="margin-top:6px">随每次选择即时重算（低迭代快解，仅用于交互反馈；正式结果以「开始解算」为准）。数据只读取当前录入内容，不写入也不覆盖已有数据。</div>
+    <div class="tiny muted" style="margin-top:6px">随每次选择即时重算（实时预览固定为教学档：目标 &lt;50 mbb/hand、预算 1.5 万次，仅供趋势反馈；正式结果以「开始解算」按所选收敛目标为准）。数据只读取当前录入内容，不写入也不覆盖已有数据。</div>
   </div>`;
 }
 /** 调度实时预览：debounce + 序号防竞态；只在新建向导第 2 步触发 */
@@ -780,10 +821,21 @@ function scheduleLivePreview() {
     updateLiveBody();
     return;
   }
-  if (key === livePreview.key && (livePreview.status === 'done' || livePreview.status === 'solving' || livePreview.status === 'queued')) return;
-  // 参数已变化：立即作废旧 Worker 回调，防止旧结果在排队窗口内覆盖新 key（切换画像后预览卡住的根因）
+  // confirm 也必须短路：refresh() 会连续调度两次，第二次不得把「待确认」覆盖成自动重算
+  if (key === livePreview.key && (livePreview.status === 'done' || livePreview.status === 'solving' || livePreview.status === 'queued' || livePreview.status === 'confirm')) return;
+  // 剥削模式：仅模式/画像/强度变更需显式确认，避免「只切一下模式」就触发双路线重算
+  const pp = `${h.mode}|${h.archetype}|${h.intensity}`;
+  if (h.mode === 'exploit' && key !== livePreview.key && liveProfilePart && liveProfilePart !== pp) {
+    livePreviewSeq++;
+    livePreview = { key, status: 'confirm', result: null, pct: 0, error: '' };
+    clearTimeout(livePreviewTimer);
+    updateLiveBody();
+    return; // 不更新 liveProfilePart：等用户点确认才受理新画像
+  }
+  // 参数已变化：立即作废旧 Worker 回调，防止旧结果在排队窗口内覆盖新 key
   livePreviewSeq++;
   livePreview = { key, status: 'queued', result: null, pct: 0.02, error: '' };
+  liveProfilePart = pp;
   clearTimeout(livePreviewTimer);
   livePreviewTimer = setTimeout(() => runLivePreview(key), 220);
 }
@@ -793,7 +845,8 @@ function runLivePreview(key) {
   const t = liveTarget(h, street);
   if (t.mode !== 'live' && t.mode !== 'review') { updateLiveBody(); return; }
   const req = buildSolveReq(h, t.di);
-  req.iterations = 15000; req.preset = 'fast'; // 实时预览用较低迭代保证交互流畅（正式解算 ≥ 10,000 次）
+  // 实时预览固定按「教学/粗略」档停止（目标 <50 mbb），只作交互反馈；正式解算用用户选定档位
+  req.iterations = 15000; req.preset = 'fast'; req.quality = 'teaching'; req.targetMbb = 50;
   const seq = ++livePreviewSeq;
   const finishWorker = () => { if (livePreviewWorker) { try { livePreviewWorker.terminate(); } catch (e) {} livePreviewWorker = null; } };
   if (typeof Worker === 'undefined') {
@@ -809,7 +862,11 @@ function runLivePreview(key) {
     const m = ev.data || {};
     if (seq !== livePreviewSeq) return; // 过期结果丢弃
     if (m.type === 'progress') {
-      if (livePreview.status !== 'done') { livePreview.status = 'solving'; livePreview.pct = m.pct; updateLiveBody(); }
+      if (livePreview.status !== 'done') {
+        livePreview.status = 'solving'; livePreview.pct = m.pct;
+        livePreview.mbb = m.exploitabilityMbb; livePreview.target = m.targetMbb;
+        updateLiveBody();
+      }
     } else if (m.type === 'result') {
       livePreview = { key, status: 'done', result: m.result, pct: 1, error: '' };
       finishWorker(); updateLiveBody();
@@ -1146,7 +1203,8 @@ function wizardStep3(h) {
     <label class="field" style="margin-top:8px"><span>自定义尺度（逗号分隔底池倍数，如 0.25,0.75）</span><input type="text" data-bind="customSizes" value="${esc((h.customSizes || []).join(','))}" placeholder="留空则使用上方预设"></label>
     <label class="check"><input type="checkbox" data-bind="allowCheckRaise" ${h.allowCheckRaise ? 'checked' : ''}>允许过牌加注 Check-Raise</label>
     <div class="grid g2" style="margin-top:6px">
-      <label class="field"><span>求解档位</span><select data-bind="preset"><option value="fast" ${h.preset === 'fast' ? 'selected' : ''}>快解（${SOLVE_ITER.fast.toLocaleString('en-US')} 次迭代）</option><option value="precise" ${h.preset === 'precise' ? 'selected' : ''}>精解（${SOLVE_ITER.precise.toLocaleString('en-US')} 次迭代）</option></select></label>
+      <label class="field"><span>收敛目标（停止指标）</span><select data-bind="quality">${Object.values(CONVERGENCE_TARGETS).map(t => `<option value="${t.id}" ${(h.quality || 'daily') === t.id ? 'selected' : ''}>${esc(t.label)} · &lt;${t.targetMbb} mbb（预算 ${t.maxIterations.toLocaleString('en-US')} 次）</option>`).join('')}</select>
+        <span class="tiny muted" style="display:block;margin-top:4px">${esc((CONVERGENCE_TARGETS[h.quality || 'daily'] || CONVERGENCE_TARGETS.daily).hint)}</span></label>
       <label class="field"><span>当前底池覆盖 (BB，留空用推算值)</span><input type="number" step="0.1" min="0.1" data-bind="potOverrideBB" value="${esc(h.potOverrideBB ?? '')}" placeholder="自动推算"></label>
       <label class="field"><span>有效后手覆盖 (BB)</span><input type="number" step="1" min="1" data-bind="stackOverrideBB" value="${esc(h.stackOverrideBB ?? '')}" placeholder="自动推算"></label>
     </div>
@@ -1202,6 +1260,15 @@ function renderResult(id) {
   const deepAllInCaution = topAction && topAction.type === 'ALLIN' && Number(shown.stacks || shown.stack || 0) >= 150
     && Number(topAction.sizeBB != null ? topAction.sizeBB : shown.stacks) > Number(shown.pot || 0) * 2;
   const bestEV = Math.max(...shown.actions.map(a => a.ev));
+  const convTarget = r.targetMbb != null ? r.targetMbb : 1;
+  const convTargetText = convTarget < 1 ? fmt(convTarget, 1) : String(Math.round(convTarget));
+  const convInvalid = r.exploitabilityMbb === 0;
+  const convReached = !!r.converged || (r.exploitabilityMbb > 0 && r.exploitabilityMbb <= convTarget);
+  const convScope = r.nashConvScope === 'gto-reference' ? '均衡基线（剥削路线非均衡，NashConv 不适用）' : '均衡解';
+  const convStatus = convInvalid
+    ? '≈0 为近似模型的测量下限，无法可靠判定收敛；结果仅供趋势参考'
+    : convReached ? '✓ 已达到目标，可停止；混合频率与价值/诈唬比例可用于复盘'
+      : '尚未达到目标；迭代已到预算上限，结果为近似趋势，不宜抠混合频率';
   const idxs = heroDecisionIndices(h);
   const pend = pendingHeroDecision(h);
   app.innerHTML = `
@@ -1230,12 +1297,19 @@ function renderResult(id) {
       }).join('')}
     </tbody></table></div>
     <div class="hr"></div>
+    <div class="conv-summary ${convReached ? 'reached' : ''}">
+      <div class="conv-main"><span class="conv-label">可剥削度 NashConv</span>
+        <b class="conv-val">${r.exploitabilityMbb == null ? '—' : (convInvalid ? '≈0' : fmt(r.exploitabilityMbb, 1))}</b><span class="conv-unit">mbb/hand</span></div>
+      <div class="conv-meta">目标 <b>&lt; ${convTargetText}</b> mbb/hand · mbb = 千分之一大盲 / 手 · 口径：${esc(convScope)}</div>
+      <div class="conv-status">${convStatus}</div>
+      <div class="tiny muted" style="margin-top:5px">迭代 ${Number(r.iterations || 0).toLocaleString('en-US')} 次${r.iterationsExploit ? ` + 剥削 ${Number(r.iterationsExploit).toLocaleString('en-US')} 次` : ''}（辅助信息） · 耗时 ${r.durationMs || 0} ms</div>
+    </div>
     <div class="grid g2">
       ${statLine('推荐主行动', shownActions.slice().sort((a, b) => b.freq - a.freq)[0]?.label || '—')}
       ${statLine('最优动作 EV', fmt(bestEV) + ' BB')}
       ${statLine('实现 EV 差', shown.evLossBB != null ? fmt(shown.evLossBB) + ' BB' : '未录入实际动作（隐藏）')}
-      ${statLine('收敛信息', `${r.iterations.toLocaleString('en-US')} 次 CFR 迭代${r.iterationsExploit ? ` + 剥削 ${r.iterationsExploit.toLocaleString('en-US')} 次` : ''} · ${r.durationMs} ms`)}
-      ${statLine('可剥削度', r.exploitabilityMbb != null ? fmt(r.exploitabilityMbb, 1) + ' mbb/hand' : '剥削模式不输出')}
+      ${statLine('收敛档位', esc((CONVERGENCE_TARGETS[r.quality] || CONVERGENCE_TARGETS.daily).label))}
+      ${statLine('迭代预算', Number(r.maxIterations || r.iterations || 0).toLocaleString('en-US') + ' 次（仅上限，不作有效性判据）')}
       ${statLine('树规模', (r.treeSize || '—') + ' 节点')}
     </div>
     ${shown.focus ? `<div class="hr"></div><h3>你的手牌 ${esc(shown.focus.cards.join(' '))}（牌力档 ${shown.focus.bucket}）</h3><div class="small muted">该手牌对 Villain 范围权益约 ${(shown.focus.equityVsVillainRange * 100).toFixed(1)}%；节点策略：${shown.focus.strategy.map(s => `${esc(s.label)} ${(s.freq * 100).toFixed(0)}%`).join(' · ')}</div>` : ''}
@@ -1255,13 +1329,12 @@ function renderResult(id) {
     <button class="btn" data-act="resRerun" data-id="${esc(job.id)}">调整参数重跑</button>
     <button class="btn" data-act="go" data-v="library">前往牌谱库</button>
   </div></div>
-  <div class="tiny muted">求解口径：${r.phase === 'preflop' ? '翻前近似（起手牌范围权益分档 + 街内 CFR，蒙特卡洛补全公共牌）' : '10 档牌力抽象 + 街内有限博弈树 + CFR 线性平均'}；${r.mode === 'exploit' ? '剥削路线按所选对手画像冻结策略后求解。' : '近似均衡，非商用 Solver 精度。'}迭代口径：1 次迭代 = 1 次 CFR 遍历，统计次数 = 实际执行次数。</div>`;
+  <div class="tiny muted">求解口径：${r.phase === 'preflop' ? '翻前近似（起手牌范围权益分档 + 街内 CFR，蒙特卡洛补全公共牌）' : '10 档牌力抽象 + 街内有限博弈树 + CFR 线性平均'}；${r.mode === 'exploit' ? '剥削路线按所选对手画像冻结策略后求解。' : '近似均衡，非商用 Solver 精度。'}停止口径：以可剥削度 NashConv（mbb/hand）达到目标为准，迭代次数仅为预算上限与辅助信息；1 次迭代 = 1 次 CFR 遍历，显示次数 = 实际执行次数。</div>`;
 }
 function progressHtml(job) {
-  const p = job.progress || 0;
-  return `<div class="row between"><span class="small">${esc(job.progressLabel || '求解中')}</span><span class="small mono">${(p * 100).toFixed(0)}%${job.etaMs ? ' · 预计剩余 ' + Math.ceil(job.etaMs / 1000) + 's' : ''}</span></div>
-  <div class="progress" style="margin-top:6px"><i style="width:${Math.round(p * 100)}%"></i></div>
-  <div class="row end" style="margin-top:8px"><button class="btn sm" data-act="cancelJob" data-id="${esc(job.id)}">取消任务</button></div>`;
+  return convHtml({ exploitabilityMbb: job.exploitabilityMbb, targetMbb: job.targetMbb, converged: job.converged, iterations: job.iterations },
+    job.progress || 0, job.progressLabel, job.etaMs)
+    + `<div class="row end" style="margin-top:8px"><button class="btn sm" data-act="cancelJob" data-id="${esc(job.id)}">取消任务</button></div>`;
 }
 function renderExploitBlock(r, tab) {
   const A = ARCHETYPES.find(a => a.id === r.archetype);
@@ -1840,6 +1913,18 @@ function handleAct(act, ds, ev) {
     case 'setMode': wizard.hand.mode = v; refresh(); break;
     case 'setArchetype': wizard.hand.archetype = v; refresh(); break;
     case 'setIntensity': wizard.hand.intensity = Number(v); refresh(); break;
+    case 'confirmExploit': {
+      if (!wizard) break;
+      const h = wizard.hand, street = actStreet(h), key = liveReqKey(h, street);
+      if (key === 'incomplete' || key === 'waiting' || key === 'closed') break;
+      livePreviewSeq++;
+      liveProfilePart = `${h.mode}|${h.archetype}|${h.intensity}`;
+      livePreview = { key, status: 'queued', result: null, pct: 0.02, error: '' };
+      clearTimeout(livePreviewTimer);
+      updateLiveBody();
+      livePreviewTimer = setTimeout(() => runLivePreview(key), 0);
+      break;
+    }
     case 'solve': beginSolve(); break;
     /* 结果页 */
     case 'resTab': ui.resTab = v; render(); break;
