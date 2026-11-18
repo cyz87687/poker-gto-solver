@@ -345,6 +345,11 @@ canvas{max-width:100%;display:block}
 .stage-nav .stage.on{border-color:var(--accent);background:var(--accent-soft);box-shadow:0 0 0 1px var(--accent) inset}
 .stage-nav .stage.on b,.stage-nav .stage.on span{color:var(--accent)}
 .stage-actions{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin:10px 0;padding:10px;background:var(--surface-2);border-radius:10px}
+/* 剥削输入常驻条（V1.13）：第 3 步默认可见 */
+.exploit-bar{margin:10px 0;padding:10px;border:1px solid var(--line);border-radius:10px;background:var(--surface-2)}
+.exploit-bar .chips{margin-top:0}
+.exploit-row{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-top:8px}
+@media(max-width:520px){.exploit-bar .chip{min-height:38px;padding:8px 12px}}
 .stage-board-card{border-left:3px solid var(--accent)}
 .card-slot.pending{opacity:.62;border-style:dashed;background:var(--surface-2)}
 @media(max-width:520px){.stage-nav{grid-template-columns:repeat(2,minmax(0,1fr))}.stage-actions .btn{flex:1 1 auto}.live-row{grid-template-columns:104px 1fr 38px 52px;font-size:11.5px}.live-act{white-space:normal;line-height:1.25}}
