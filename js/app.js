@@ -175,6 +175,7 @@ function buildSolveReq(h, decisionIndex) {
   return {
     board, heroCards: h.heroCards || [], villainCards: h.villainCards || [], deadCards: h.deadCards || [],
     heroRange: ranges.hero, villainRange: ranges.villain, rangeNote: ranges.note,
+    villainRangeLocked: ranges.villainLevel > 0,
     pot, stack, facingBet, heroOOP: st.heroOOP, oppChecked,
     sizes: h.sizes, allowCheckRaise: h.allowCheckRaise, preset: h.preset,
     mode: h.mode, archetype: h.archetype, intensity: h.intensity,
@@ -604,6 +605,10 @@ function liveWhyHtml(r, req, actsIn = null) {
   };
   if (whyMap[rec.type]) lines.push(`主要判断依据：${whyMap[rec.type]}。`);
   if (req && req.rangeNote) lines.push(`范围口径：${esc(req.rangeNote)}。`);
+  const allinSize = rec.type === 'ALLIN' ? Number(rec.sizeBB != null ? rec.sizeBB : (Number(req.stack) || 0) + toCall) : 0;
+  if (allinSize > pot * 2 && (Number(req.stack) || 0) >= 150) {
+    lines.push(`风险提示：全下 ${fmt(allinSize, 1)} BB 超过底池 2 倍且属深码，需对手大量弃牌才成立；模型为近似结果，实盘慎用。`);
+  }
   return `<div class="live-why"><div class="why-hd">为什么推荐</div>${lines.map(l => `<div class="why-line">${l}</div>`).join('')}</div>`;
 }
 /** 实时面板主体：waiting/closed/incomplete 直接给出状态说明；live/review 走求解状态机 */
@@ -776,6 +781,8 @@ function scheduleLivePreview() {
     return;
   }
   if (key === livePreview.key && (livePreview.status === 'done' || livePreview.status === 'solving' || livePreview.status === 'queued')) return;
+  // 参数已变化：立即作废旧 Worker 回调，防止旧结果在排队窗口内覆盖新 key（切换画像后预览卡住的根因）
+  livePreviewSeq++;
   livePreview = { key, status: 'queued', result: null, pct: 0.02, error: '' };
   clearTimeout(livePreviewTimer);
   livePreviewTimer = setTimeout(() => runLivePreview(key), 220);
@@ -1021,11 +1028,12 @@ function wizardStep2(h, di, v, rd) {
 
   return `<div class="card"><div class="card-title"><h2>③ 选择行动</h2><span class="tiny muted">已录入 ${acts.length} 条 · 点卡片即录入</span></div>
     ${readinessStrip(rd)}
+    ${exploitBarHtml(h)}
     <div class="stage-nav">${stageNav}</div>
     <div class="stage-actions">
       ${nextSt ? `<button class="btn primary" data-act="advanceStage">下一步：${STREET_NAME[nextSt]} →</button>` : '<span class="tiny muted">已到河牌，可直接解算</span>'}
       ${si > 0 && boardNow < boardNeed ? `<button class="btn sm" data-act="solveStreet" data-v="${STREETS[si - 1]}" title="切换回上一街并解算该街的 Hero 决策">先解算${STREET_NAME[STREETS[si - 1]]}</button>` : ''}
-      <button class="btn sm" data-act="toggleParams">${wizard.paramsOpen ? '收起求解参数' : '求解参数（范围 / 尺度 / 模式）'}</button>
+      <button class="btn sm" data-act="toggleParams">${wizard.paramsOpen ? '收起求解参数' : '求解参数（范围 / 尺度 / 剥削画像）'}</button>
       <span class="tiny muted">当前阶段：${STREET_NAME[street]}</span>
     </div>
     <div class="turn-bar ${closed ? 'is-closed' : ''}">
@@ -1116,6 +1124,14 @@ function sizeChips(h) {
   const presets = [[0.33, '33%'], [0.5, '50%'], [0.67, '67%'], [1, '满池'], [1.33, '超池']];
   return presets.map(([v, n]) => `<button class="chip ${h.sizes.includes(v) ? 'on' : ''}" data-act="toggleSize" data-v="${v}">${n}</button>`).join('');
 }
+/* 剥削输入常驻条：第 3 步默认可见，不再藏在「求解参数」折叠面板里 */
+function exploitBarHtml(h) {
+  const modeChips = `<div class="chips"><button class="chip ${h.mode === 'gto' ? 'on' : ''}" data-act="setMode" data-v="gto">标准 GTO</button><button class="chip ${h.mode === 'exploit' ? 'on' : ''}" data-act="setMode" data-v="exploit">剥削模式</button></div>`;
+  const detail = h.mode !== 'exploit' ? '' : `<div class="exploit-row"><span class="tiny muted">对手画像</span><div class="chips">${ARCHETYPES.map(a => `<button class="chip ${h.archetype === a.id ? 'on' : ''}" data-act="setArchetype" data-v="${a.id}">${a.name} ${a.tag}</button>`).join('')}</div></div>
+    <div class="exploit-row"><span class="tiny muted">强度</span><div class="chips">${[[0.5, '轻度'], [1, '中度'], [1.5, '重度']].map(([v, n]) => `<button class="chip ${Number(h.intensity) === v ? 'on' : ''}" data-act="setIntensity" data-v="${v}">${n}</button>`).join('')}</div></div>
+    <div class="tiny muted" style="margin-top:6px">画像通过节点锁定求 Hero 最优应对；对手范围已按行动收窄时，松型画像不会再放宽范围。</div>`;
+  return `<div class="exploit-bar"><div class="row between"><div class="small"><b>求解模式</b><span class="tiny muted"> · ${h.mode === 'exploit' ? '剥削（对手画像）' : '标准 GTO'}</span></div>${modeChips}</div>${detail}</div>`;
+}
 function wizardStep3(h) {
   return `<div class="card"><h2>对手范围与求解参数</h2>
     <div class="grid g2">
@@ -1178,7 +1194,13 @@ function renderResult(id) {
   const h = state().hands.find(x => x.id === job.handId) || defaultHand();
   const tab = ui.resTab || (r.mode === 'exploit' ? 'exploit' : 'gto');
   const shown = tab === 'gto' && r.gtoActions ? { ...r, actions: r.gtoActions, evLossBB: r.gtoEvLossBB, mode: 'gto' } : r;
-  const maxFreq = Math.max(0.0001, ...shown.actions.map(a => a.freq));
+  // 主表按「你的手牌」条件频率展示（与决策面板同源）；EV 仍为动作在全范围下的平均值
+  const handFreq = shown.focus?.strategy?.length === shown.actions.length ? shown.focus.strategy.map(s => s.freq) : null;
+  const shownActions = shown.actions.map((a, i) => handFreq ? { ...a, freq: handFreq[i], rangeFreq: a.freq } : a);
+  const maxFreq = Math.max(0.0001, ...shownActions.map(a => a.freq));
+  const topAction = shownActions.slice().sort((a, b) => b.freq - a.freq)[0];
+  const deepAllInCaution = topAction && topAction.type === 'ALLIN' && Number(shown.stacks || shown.stack || 0) >= 150
+    && Number(topAction.sizeBB != null ? topAction.sizeBB : shown.stacks) > Number(shown.pot || 0) * 2;
   const bestEV = Math.max(...shown.actions.map(a => a.ev));
   const idxs = heroDecisionIndices(h);
   const pend = pendingHeroDecision(h);
@@ -1197,8 +1219,10 @@ function renderResult(id) {
       <span class="st">下一步</span><span class="ac">Hero 待应对 ${fmt(pend.toCall, 1)} BB</span>${pend.index === job.params.decisionIndex ? '<span class="tag">当前</span>' : ''}</div>` : ''}
   </div><div class="tiny muted" style="margin-top:6px">点击 Hero 决策可切换复盘节点（重新求解）</div></div>
   <div class="card"><div class="card-title"><h2>${tab === 'exploit' ? '剥削路线输出' : '均衡输出'}</h2><span class="pill">EV 单位：BB</span></div>
+    <div class="tiny muted" style="margin-bottom:6px">频率按你的手牌 ${shown.focus ? esc(shown.focus.cards.join(' ')) : ''} 的条件策略；EV 为全范围动作平均值。</div>
+    ${deepAllInCaution ? '<div class="notice" style="margin-bottom:8px">风险提示：主推深码超底池全下，需对手大量弃牌才成立；模型为近似结果，实盘慎用。</div>' : ''}
     <div class="table-wrap"><table class="ev-table"><thead><tr><th>动作</th><th class="num">${tab === 'exploit' ? '剥削频率' : '均衡频率'}</th><th class="num">动作 EV</th><th>标签</th></tr></thead><tbody>
-      ${shown.actions.map((a, i) => {
+      ${shownActions.map((a, i) => {
         const badge = a.freq >= 0.66 ? '<span class="badge hi">高频</span>' : a.freq >= 0.33 ? '<span class="badge mid">混合</span>' : a.freq > 0 ? '<span class="badge lo">低频</span>' : '<span class="badge zero">零频率</span>';
         return `<tr class="${a.ev >= bestEV - 1e-9 ? 'hl' : ''}"><td>${esc(a.label || a.type)}${a.sizeBB != null && !String(a.label || '').includes(' BB') ? ` <span class="tiny muted">${fmt(a.sizeBB, 1)} BB</span>` : ''}</td>
           <td class="num">${(a.freq * 100).toFixed(1)}%<div class="bar" style="margin-top:3px"><i style="width:${(a.freq / maxFreq * 100).toFixed(0)}%"></i></div></td>
@@ -1207,7 +1231,7 @@ function renderResult(id) {
     </tbody></table></div>
     <div class="hr"></div>
     <div class="grid g2">
-      ${statLine('推荐主行动', shown.actions.slice().sort((a, b) => b.freq - a.freq)[0]?.label || '—')}
+      ${statLine('推荐主行动', shownActions.slice().sort((a, b) => b.freq - a.freq)[0]?.label || '—')}
       ${statLine('最优动作 EV', fmt(bestEV) + ' BB')}
       ${statLine('实现 EV 差', shown.evLossBB != null ? fmt(shown.evLossBB) + ' BB' : '未录入实际动作（隐藏）')}
       ${statLine('收敛信息', `${r.iterations.toLocaleString('en-US')} 次 CFR 迭代${r.iterationsExploit ? ` + 剥削 ${r.iterationsExploit.toLocaleString('en-US')} 次` : ''} · ${r.durationMs} ms`)}
@@ -1244,7 +1268,7 @@ function renderExploitBlock(r, tab) {
   return `<div class="card"><h2>剥削模式（对手画像）</h2><div class="grid g2">
     ${statLine('对手画像', (A ? A.name + ' ' + A.tag : r.archetypeLabel) || '—')}
     ${statLine('强度档', r.intensity === 0.5 ? '轻度' : r.intensity === 1.5 ? '重度' : '中度')}
-    ${statLine('剥削增益', r.exploitGainBB != null ? fmt(r.exploitGainBB) + ' BB' : '—')}
+    ${statLine('剥削增益', r.exploitGainBB != null ? fmt(r.exploitGainBB) + ' BB' + (r.exploitGainBB < 0 ? '（剥削更差，建议切回 GTO）' : '') : '—')}
     ${statLine('范围宽度倍率', r.lockedInfo ? fmt(r.lockedInfo.params.width) + '×' : '—')}
   </div><div class="tiny muted" style="margin-top:8px">剥削增益 = EV(剥削路线) − EV(GTO 路线)，二者均在<b>同一画像假设环境</b>下计算。${tab === 'gto' ? '当前显示 GTO 基准路线。' : ''}</div></div>`;
 }
