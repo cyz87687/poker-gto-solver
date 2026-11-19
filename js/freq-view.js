@@ -1,7 +1,7 @@
 /* freq-view.js —— V1.19 图形化频率展示（纯函数 / 无 DOM / 无副作用）
  * 设计目标：把求解结果里的频率按「宽度即数值」可视化，并支持点击下钻到花色组合。
  * 颜色沿用现有策略热力图口径：弃牌灰蓝、跟注蓝、加注红（红=进攻，与 A 股涨色同源）。 */
-import { RANKS, SUITS, SUIT_SYM } from './cards.js?v=1.18.3';
+import { RANKS, SUITS, SUIT_SYM } from './cards.js?v=1.20.0';
 
 export const FREQ_COLORS = {
   fold:  { solid: '#6b7787', soft: '#e8ecf3', fg: '#5a6678', letter: 'F', name: '弃牌' },

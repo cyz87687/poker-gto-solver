@@ -1,21 +1,21 @@
 /* app.js —— SPA 主程序：路由、向导录入、求解队列、结果页、台账、统计、牌谱库、备份 */
-import { RANKS, SUITS, SUIT_SYM, cardStr, cardLabel, isRed, parseCardList, parseCard, presetMatrix, emptyMatrix, RANGE_PRESETS, classLabel } from './cards.js?v=1.18.3';
+import { RANKS, SUITS, SUIT_SYM, cardStr, cardLabel, isRed, parseCardList, parseCard, presetMatrix, emptyMatrix, RANGE_PRESETS, classLabel } from './cards.js?v=1.20.0';
 import {
   STREETS, POS6, POS9, ACTION_TYPES, BUILTIN_TAGS, ARCHETYPES, positionsFor, makeId, defaultHand,
   formatAction, parseHH, validateHand, deriveState, heroDecisionIndices, pendingHeroDecision, serializeHH, handClass, handProfitBB,
   parseActionText, normalizeActionAmounts, solveReadiness, firstToActPostflop,
   stageFromBoard, stageBoardCount, actionFlow
-} from './hand.js?v=1.18.3';
+} from './hand.js?v=1.20.0';
 import {
   initDB, state, commit, persist, saveDraft, clearDraft, upsertSession, removeSession, upsertHand, removeHand,
   bindHand, upsertJob, findCachedJob, jobCacheKey, escapeHtml,
   computeStats, sessionNet, sessionBuyin, exportJSON, importJSON, exportSessionsCSV, exportHandHH, downloadText
-} from './db.js?v=1.18.3';
-import { drawCurve, drawBars, renderHeatmapGrid, renderStrategyHeatmap, buildResultImage } from './charts.js?v=1.18.3';
-import { freqItems, freqOverviewHtml, freqCellHtml, freqActionHtml, comboCodesForClass } from './freq-view.js?v=1.18.3';
-import { solveCore, SOLVE_ITER, CONVERGENCE_TARGETS } from './solver-core.js?v=1.18.3';
-import { solverSizeOptions } from './ui-sizes.js?v=1.18.3';
-import { rangesForDecision } from './range-by-action.js?v=1.18.3';
+} from './db.js?v=1.20.0';
+import { drawCurve, drawBars, renderHeatmapGrid, renderStrategyHeatmap, buildResultImage } from './charts.js?v=1.20.0';
+import { freqItems, freqOverviewHtml, freqCellHtml, freqActionHtml, comboCodesForClass } from './freq-view.js?v=1.20.0';
+import { solveCore, SOLVE_ITER, CONVERGENCE_TARGETS } from './solver-core.js?v=1.20.0';
+import { solverSizeOptions } from './ui-sizes.js?v=1.20.0';
+import { rangesForDecision } from './range-by-action.js?v=1.20.0';
 
 const $ = s => document.querySelector(s);
 const app = $('#app');
@@ -95,7 +95,7 @@ class SolverQueue {
     const run = () => {
       if (typeof Worker === 'undefined') { this.fallback(item); return; }
       let w;
-      try { w = new Worker(new URL('./solver.worker.js?v=1.18.3', import.meta.url), { type: 'module' }); }
+      try { w = new Worker(new URL('./solver.worker.js?v=1.20.0', import.meta.url), { type: 'module' }); }
       catch (e) { this.fallback(item); return; }
       item.worker = w;
       w.onerror = ev => this.fail(item, '求解线程异常：' + (ev.message || '未知错误'));
@@ -957,7 +957,7 @@ function runLivePreview(key) {
   }
   finishWorker();
   let w;
-  try { w = new Worker(new URL('./solver.worker.js?v=1.18.3', import.meta.url), { type: 'module' }); }
+  try { w = new Worker(new URL('./solver.worker.js?v=1.20.0', import.meta.url), { type: 'module' }); }
   catch (e) { finishWorker(); livePreview = { key, status: 'error', result: null, pct: 0, error: '无法启动后台线程' }; render(); return; }
   livePreviewWorker = w;
   w.onmessage = ev => {
@@ -1089,6 +1089,7 @@ function actionCardsHtml(h, live, toCall, street, flow, statCtx = null) {
       const solveOpts = statCtx ? solverSizeOptions(statCtx.acts, 'RAISE', allinTo, minTo) : null;
       out.push(sizeActionCard('RAISE_TO', '加注至', `面对 ${fmt(Number(live.highest) || 0, 1)} BB · 最小加注至 ${fmt(minTo, 1)} BB`, solveOpts || raiseSizes(live, allinTo), false, '', stat));
     }
+    else if (ownRem > toCall + 0.5) notes.push('你的后手不足以凑出一次完整最小加注：常规「加注至」不可选，但「全下」仍是合法的加注形态（下方可选），求解器会把它当作独立动作单独评估。');
     else notes.push('对手已全下或你的后手不足以最小加注：当前只有「弃牌 / 跟注」两个选项。');
   } else {
     notes.push('无人下注：不提供「跟注 / 加注」；可免费过牌时「弃牌」无意义，也不提供。');

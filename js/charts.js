@@ -1,7 +1,7 @@
 /* charts.js —— Canvas 图表（无外部依赖，离线可用）
  * 红涨绿跌：盈利红、亏损绿（A 股习惯）
  */
-import { RANKS, classLabel } from './cards.js?v=1.18.3';
+import { RANKS, classLabel } from './cards.js?v=1.20.0';
 
 const UP = '#d92b2b', DOWN = '#128a56', ACCENT = '#3b5bdb';
 const GRID = '#e6e9ef', TEXT = '#5c6675', SURFACE = '#ffffff';
@@ -134,21 +134,27 @@ export function renderStrategyHeatmap(container, grid, opts = {}) {
       if (!cell) { html += '<div class="cell" style="background:#fafbfd"></div>'; continue; }
       const st = STRAT_STYLE[cell.main] || STRAT_STYLE.fold;
       const mainV = cell[cell.main] || 0;
-      // 纯策略显示动作字母，混合策略显示「字母+频率」
-      const label = cell.mix ? `${st.letter}${Math.round(mainV * 100)}` : st.letter;
       const cards = (cell.cards || []).join(' · ');
       const tip = `${classLabel(i, j)}｜主策略 ${st.name} ${(mainV * 100).toFixed(0)}%｜弃 ${(cell.fold * 100).toFixed(0)}% / 跟 ${(cell.call * 100).toFixed(0)}% / 加 ${(cell.raise * 100).toFixed(0)}%${cards ? '｜' + cards : ''}`;
       const isFocus = focusCards.length === 2 && cellMainMatches(cell, focusCards, i, j);
       const focusRing = isFocus ? ' outline:2px solid #3b5bdb;outline-offset:-2px;font-weight:700;' : '';
+      // V1.20：格子里直接写手牌类别（如 A6s / AK / 66），底色=主策略动作；
+      // 混合策略用「斜分双色」表达两个动作（与商用 Solver 一致），具体频率看悬停与点击详情。
+      const three = [{ k: 'fold', v: cell.fold || 0 }, { k: 'call', v: cell.call || 0 }, { k: 'raise', v: cell.raise || 0 }]
+        .sort((a, b) => b.v - a.v);
+      const second = cell.mix && three[1] && three[1].v > 0.02 ? three[1].k : null;
+      const bg = second
+        ? `linear-gradient(135deg, ${st.bg} 0 50%, ${(STRAT_STYLE[second] || STRAT_STYLE.fold).bg} 50% 100%)`
+        : st.bg;
       // V1.19 点击下钻：格子携带类别索引，由 app.js 全局委托打开花色频率详情
-      html += `<div class="cell" data-act="freqCell" data-i="${i}" data-j="${j}" role="button" tabindex="0" aria-label="${classLabel(i, j)} 频率详情" style="background:${st.bg};color:${st.fg};${focusRing}" title="${tip.replace(/"/g, '')}">${label}</div>`;
+      html += `<div class="cell" data-act="freqCell" data-i="${i}" data-j="${j}" role="button" tabindex="0" aria-label="${classLabel(i, j)} 频率详情" style="background:${bg};color:${st.fg};${focusRing}" title="${tip.replace(/"/g, '')}"><span class="cl">${classLabel(i, j)}</span></div>`;
     }
   }
   html += '</div></div>';
   // 图例：三色策略 + 标注规则
   html += `<div class="strat-legend" style="margin-top:7px">`
     + Object.keys(STRAT_STYLE).map(k => { const s = STRAT_STYLE[k]; return `<span><i style="background:${s.bg};color:${s.fg}">${s.letter}</i>${s.name}</span>`; }).join('')
-    + `<span class="tiny muted">字母=纯策略 · 字母+数字=混合策略及频率 · 蓝框=你的手牌 · 点击格子看花色频率</span></div>`;
+    + `<span class="tiny muted">格内=手牌类别 · 底色=主策略 · 斜分=混合策略（两色=两个动作） · 蓝框=你的手牌 · 点击看花色频率</span></div>`;
   // 分组说明：按牌型区域解释为何这样分
   if (opts.note) html += `<div class="tiny muted" style="margin-top:6px;line-height:1.5">${opts.note}</div>`;
   container.innerHTML = html;

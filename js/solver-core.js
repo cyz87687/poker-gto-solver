@@ -7,11 +7,11 @@
 import {
   matrixToCombos, comboEquityVsRange, bucketize, buildEquityMatrix,
   deckExcluding, mulberry32, hashSeed, cardStr, eval7, classLabel
-} from './cards.js?v=1.18.3';
-import { applyArchetypeToRange } from './range-by-action.js?v=1.18.3';
+} from './cards.js?v=1.20.0';
+import { applyArchetypeToRange } from './range-by-action.js?v=1.20.0';
 import {
   ARCHETYPE_PARAMS, rangeConditionParams, foldToRaiseByStreet, streetAdjustedRangeCondition
-} from './archetypes.js?v=1.18.3';
+} from './archetypes.js?v=1.20.0';
 
 export const N_BUCKETS = 10;
 /* V1.15：画像参数集中到 archetypes.js，solver-core 与范围派生层共用同一份口径 */
@@ -95,23 +95,37 @@ function actionList(s, ctx) {
     A({ type: 'FOLD', key: 'F', label: '弃牌' });
     A({ type: 'CALL', amount: toCallEff, key: 'C', label: callLabel(toCallEff) });
     const canRaise = s.raises < ctx.maxRaises && !(ctx.checkRaise === false && s.afterCheck);
-    if (canRaise && rem > s.toCall + 0.5) {
+    // V1.20：区分「行动者自己的后手」与「有效后手」（双方还能 contested 的筹码）。
+    // 面对的下注可能大于对手剩余（对手已近全下），此时常规加注在筹码上放不下，
+    // 但「全下」仍然是物理可行的唯一加注形态——必须进动作集，
+    // 否则坚果（例如 A-K-T 河牌的 QJ 顺子）连加注都没有，模型结构性失真。
+    const actorRemNow = remFor(s, s.toAct);
+    const oppRem = remFor(s, other(s.toAct));
+    const remEff = Math.min(actorRemNow, oppRem);
+    if (canRaise) {
       const pool = s.pot + s.toCall;
       const actorInv = inv(s, s.toAct);
+      let ladder = false;
       for (const size of ctx.sizes) {
-        const inc = clamp(size * pool, s.toCall, Math.max(s.toCall, rem - s.toCall));
+        const inc = clamp(size * pool, s.toCall, Math.max(s.toCall, remEff - s.toCall));
         if (inc > s.toCall + 0.2) {
           // 展示口径：加注至 = 行动者本街总投入（已投入 + 跟注 + 加注增量），直接给具体 BB 数
           const incR = Math.round(inc * 10) / 10;
           const raiseTo = Math.round((actorInv + s.toCall + incR) * 10) / 10;
           acts.push({ type: 'RAISE', amount: incR, raiseTo, size, key: 'R' + size, label: `加注至 ${raiseTo.toFixed(1)} BB` });
+          ladder = true;
         }
       }
-      // 全下只在「相对底池合理」的深度进入均衡动作集：深码超底池 all-in 需极端弃牌率，
-      // 近似模型会系统性高估其 EV（深码 5bet 弱牌被判 100% 全下），故不再作为常规尺度。
-      if (rem > s.toCall * 2 && rem <= 1.5 * s.pot) {
-        const aiAmt = Math.round(rem * 10) / 10;
-        acts.push({ type: 'ALLIN', amount: aiAmt, key: 'AI', label: `全下 ${aiAmt.toFixed(1)} BB` });
+      // 全下（shove）：对手还需再跟的筹码 = min(自己剩余 − 跟注额, 对手剩余)
+      const shoveExtra = Math.min(actorRemNow - s.toCall, oppRem);
+      // 深码超底池全下不进均衡动作集：近似模型会系统性高估其 EV（深码 5bet 弱牌被判 100% 全下）
+      const notOverPot = remEff <= 1.5 * s.pot;
+      // 常规加注存在时，仍要求有效后手大于两倍下注（保留 V1.13 口径）；
+      // 常规加注放不下时（ladder=false），全下是唯一可行形态，放宽该门槛。
+      const deepOk = !ladder || remEff > s.toCall * 2;
+      if (shoveExtra > 0.5 && notOverPot && deepOk) {
+        const total = Math.round((s.toCall + shoveExtra) * 10) / 10;
+        acts.push({ type: 'ALLIN', amount: Math.round(shoveExtra * 10) / 10, raiseTo: total, key: 'AI', label: `全下 ${total.toFixed(1)} BB` });
       }
     }
   } else {
@@ -168,8 +182,12 @@ function applyAction(s, a) {
       n.checked = { hero: false, villain: false }; n.afterCheck = false; n.toAct = other(p); break;
     }
     case 'ALLIN': {
-      const amt = Math.max(0, Math.min(a.amount, remFor(s, p)));
-      n.pot += amt; setInv(n, p, inv(n, p) + amt); n.toCall = amt; n.raises++; n.allin = true;
+      // V1.20：面对下注时的全下先补齐跟注额、再投入剩余筹码。
+      // 旧实现只投入增量、漏算跟注段 → 底池少算，且对手被要求跟一个错误的额度（把跟注额当增量）。
+      // a.amount 统一为「跟注额之外的增量」；无人下注时 toCall=0，增量=总投入，语义不变。
+      const call = Math.min(s.toCall, remFor(s, p));
+      const inc = Math.max(0, Math.min(a.amount, remFor(s, p) - call));
+      n.pot += call + inc; setInv(n, p, inv(n, p) + call + inc); n.toCall = inc; n.raises++; n.allin = true;
       n.checked = { hero: false, villain: false }; n.toAct = other(p); break;
     }
   }
@@ -935,21 +953,29 @@ function focusStrategy(req, rootNode, acts, combos, hb, eq, pH, eqCtx, ctx) {
         // V1.17 解耦：弃牌率只由「翻后继续率」决定（TAG 强范围少弃→foldP 低；LAG 空气多→foldP 高），
         // 与「被跟注面对多强范围」（eqCont，已用 contTopFrac）互相独立。
         const to = a.raiseTo != null ? a.raiseTo : (a.amount || 0) + facing;
-        const invest = to; // Hero 本街总投入（含已投入）
+        const invest = to; // Hero 本街总投入（含已投入与跟注段）
         const callP = rc.postflopContinueFrac != null ? rc.postflopContinueFrac : rc.callContinueFrac;
         const foldP = 1 - callP;
-        const potIfFold = pot + invest; // 对手下注已在 pot，弃牌损失其投入
-        const potIfCall = pot + invest * 2;
-        // 弃牌赢池需扣掉自己已投入
-        return foldP * (pot - (to - facing)) + callP * (eqCont * potIfCall - invest);
+        // V1.20 记账修正：pot = req.pot 已含对手这手下注额 facing
+        //   · 对手弃牌：底池 = pot + invest，Hero 赢回自己的投入 → 净收益 = pot
+        //     （旧式 pot - (to - facing) 漏算了自己多投的那段，虚低弃牌分支）
+        //   · 对手跟注：对手再补 (invest - facing) → 底池 = pot + invest + (invest - facing)
+        //     （旧式 pot + invest*2 多算了一个 facing，虚高被跟注分支）
+        const potIfFold = pot + invest;
+        const potIfCall = pot + invest + Math.max(0, invest - facing);
+        return foldP * (potIfFold - invest) + callP * (eqCont * potIfCall - invest);
       }
       return 0;
     };
     const evs = acts.map(evOf);
     const best = evs.reduce((bi, v, i) => v > evs[bi] ? i : bi, 0);
-    // 用 softmax 保留一定混合（避免硬切换），温度按 EV 差缩放
+    // 用 softmax 保留一定混合（避免硬切换），温度按 EV 差缩放。
+    // V1.20：温度设上限——旧式 temp ∝ EV 差距意味着「差距越大越混」，
+    // 而记账修正后 EV 差距普遍变大（例：河牌 call +4.0 vs 全下 −7.6），
+    // 会把明显负 EV 的动作也分到两成频率。现在温度封顶 1.5 BB：
+    // EV 差距大时按固定不确定性近似，差距小时仍保留混合。
     const maxEv = Math.max(...evs), minEv = Math.min(...evs);
-    const temp = Math.max(0.3, (maxEv - minEv) * 0.35);
+    const temp = Math.min(1.5, Math.max(0.3, (maxEv - minEv) * 0.35));
     const w = evs.map(v => Math.exp((v - maxEv) / temp));
     const wsum = w.reduce((a, x) => a + x, 0);
     sr = roundedFreqs(w.map(x => x / wsum));

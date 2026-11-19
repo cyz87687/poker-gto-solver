@@ -873,6 +873,7 @@ Flop: [Kh7s2c]  BB bet 8.8`;
   /* 核心：100% raise 消失，call 成为主推荐 */
   const top16 = r => r.focus.strategy.slice().sort((a, b) => b.freq - a.freq)[0];
   const callFreq = r => (r.focus.strategy.find(a => a.type === 'CALL') || { freq: 0 }).freq;
+  const condEv16 = (r, type) => { const i = r.focus.strategy.findIndex(a => a.type === type); return i >= 0 && r.focus.conditional ? r.focus.conditional.evs[i] : null; };
   const maxRaise16 = r => Math.max(0, ...r.focus.strategy.filter(a => a.type === 'RAISE' || a.type === 'ALLIN').map(a => a.freq));
   ok('[V1.16] GTO 不再 100% raise', maxRaise16(g16) < 0.6, 'maxRaise=' + (maxRaise16(g16) * 100).toFixed(0) + '%');
   ok('[V1.16] GTO 跟注占比 > 30%', callFreq(g16) > 0.3, (callFreq(g16) * 100).toFixed(0) + '%');
@@ -892,8 +893,23 @@ Flop: [Kh7s2c]  BB bet 8.8`;
   ok('[V1.16] TAG 下注范围权益 < LAG（紧范围权益更小）',
     tag16.focus.conditional.eqCall < lag16.focus.conditional.eqCall - 0.05,
     `tag=${tag16.focus.conditional.eqCall} lag=${lag16.focus.conditional.eqCall}`);
-  ok('[V1.16] LAG 跟注占比 ≥ GTO（诈唬捕捉价值更高）', callFreq(lag16) >= callFreq(g16) - 0.05,
-    `lag=${(callFreq(lag16) * 100).toFixed(0)}% gto=${(callFreq(g16) * 100).toFixed(0)}%`);
+  /* V1.20 记账修正后：LAG 场景「大尺度半诈唬加注」在冻结画像下略优于平跟
+   * （弃牌分支不再被低估），跟注份额被加注分流 → 原「跟注占比」断言改为更本质的量：
+   * LAG 下注范围权益显著高于 GTO（诈唬捕捉价值更高），两者均为正 EV。 */
+  ok('[V1.16] LAG 对下注范围权益 > GTO（诈唬捕捉价值更高）',
+    lag16.focus.conditional.eqCall > g16.focus.conditional.eqCall + 0.05,
+    `lag=${lag16.focus.conditional.eqCall} gto=${g16.focus.conditional.eqCall}`);
+  ok('[V1.16] LAG 跟注仍为正 EV（诈唬捕捉价值被计入）',
+    condEv16(lag16, 'CALL') > 0, condEv16(lag16, 'CALL') + ' BB');
+  /* 加注 EV 记账自洽：弃牌分支净收益 = 底池；被跟注底池 = pot + invest + (invest - facing) */
+  ok('[V1.16] 加注 EV 记账自洽（弃牌分支=底池，被跟注底池含跟注段）', (() => {
+    const c = tag16.focus.conditional;
+    const i = tag16.focus.strategy.findIndex(a => a.type === 'RAISE');
+    if (i < 0 || !c) return false;
+    const pot = 26.4, facing = 8.8, invest = 20.4;
+    const expect = c.foldP * pot + (1 - c.foldP) * (c.eqCont * (pot + invest + (invest - facing)) - invest);
+    return Math.abs(c.evs[i] - expect) < 0.15;
+  })(), (() => { const c = tag16.focus.conditional; const i = tag16.focus.strategy.findIndex(a => a.type === 'RAISE'); return 'ev=' + (c && c.evs[i]); })());
 
   /* 参数源：GTO 固定平衡值，画像各不同，且本次新增字段不改变既有 width */
   ok('[V1.16] GTO 条件化参数为固定平衡值', near(rangeConditionParams('gto', 'lag').betValueFrac, GTO_RANGE_CONDITION.betValueFrac, 1e-9));
@@ -1130,6 +1146,66 @@ console.log('\n[20] V1.19 图形化频率展示与花色下钻');
 
   const actionDetail = freqActionHtml({ kind: 'call', rows: [{ i: 12, j: 5, label: 'A6s', cell, freq: 0.55 }], title: 'GTO 均衡' });
   ok('[V1.19] 动作详情可继续下钻到手牌类别', /data-act="freqCell"/.test(actionDetail) && /A6s/.test(actionDetail));
+}
+
+console.log('\n[21] V1.20 面对下注的全下选项 + 加注记账修正');
+{
+  const HH = `# PokerGTO HH v1
+Game: NLHE
+Stakes: SB=1 BB=2
+Table: 6max
+Hero: BTN [Kc4d]
+Stacks: Hero=100 Villain=100 (BB)
+Preflop:  BTN raise 2.7, BB raise 8.8, BTN call 6.1
+Flop: [Kh7s2c]  BB bet 8.8, BTN raise 20.4, BB call 11.6
+Turn: [Kh7s2cTs]  BB check, BTN check
+River: [Kh7s2cTsAc]  BB bet 39.1`;
+  const { hand: h20 } = parseHH(HH);
+  const idx20 = pendingHeroDecision(h20).index;
+  const s20 = deriveState(h20, idx20);
+  const rg20 = rangesForDecision(h20, idx20, { mode: 'gto', intensity: 1, stackBB: s20.rem.hero });
+  const r20 = solveCore({
+    board: s20.board, heroCards: h20.heroCards, villainCards: [], deadCards: [],
+    heroRange: rg20.hero, villainRange: rg20.villain,
+    villainRangeLocked: rg20.villainLevel > 0, villainRangePreNarrowed: rg20.widthInfo != null,
+    pot: s20.pot, stack: s20.stack, facingBet: s20.facingBet,
+    heroOOP: s20.heroOOP, oppChecked: s20.oppChecked,
+    sizes: h20.sizes, allowCheckRaise: h20.allowCheckRaise, preset: 'fast',
+    mode: 'gto', archetype: 'tag', intensity: 1, iterations: 20000
+  });
+  /* ① 动作集必须含「全下」：对手只剩 31.7BB（小于跟注额 39.1），常规加注在筹码上放不下，
+   *    「全下」是唯一物理可行的加注形态 —— 旧版把整个加注块跳过了。 */
+  const ai20 = r20.actions.find(a => a.type === 'ALLIN');
+  ok('[V1.20] 面对大额下注时动作集含「全下」', !!ai20, ai20 ? ai20.label : '无');
+  ok('[V1.20] 全下金额 = 本街总投入（跟注 39.1 + 可被跟 31.7 = 70.8 BB）',
+    ai20 && Math.abs(ai20.sizeBB - 70.8) < 0.3, ai20 && ai20.sizeBB);
+  /* ② 坚果必须能加注：河牌 A-K-T 的 QJ 是顺子（nuts 级），不能只跟注 */
+  const sh20 = r20.heatmap.strategy.hero;
+  const qjs20 = sh20[10][9];   // RANKS: J=9, Q=10 → 同花类 [hi,lo] = [10,9]
+  ok('[V1.20] 河牌坚果 QJs 为加注 100%（不再是只能弃/跟）',
+    qjs20 && qjs20.raise > 0.9 && qjs20.main === 'raise',
+    qjs20 ? `弃${qjs20.fold} 跟${qjs20.call} 加${qjs20.raise}` : 'null');
+  ok('[V1.20] 弱牌 K4 的全下 EV 为负（坚果加注 ≠ 弱牌加注）', (() => {
+    const i = r20.focus.strategy.findIndex(a => a.type === 'ALLIN');
+    return i >= 0 && r20.focus.conditional && r20.focus.conditional.evs[i] < 0;
+  })(), (() => { const i = r20.focus.strategy.findIndex(a => a.type === 'ALLIN'); return 'shove EV=' + (r20.focus.conditional && r20.focus.conditional.evs[i]); })());
+  ok('[V1.20] K4 仍以跟注为主（老大给定 95/5 口径）',
+    (r20.focus.strategy.find(a => a.type === 'CALL')?.freq || 0) > 0.85,
+    'call=' + ((r20.focus.strategy.find(a => a.type === 'CALL')?.freq || 0) * 100).toFixed(1) + '%');
+  /* ③ 记账自洽：加注的弃牌分支净收益 = 底池（自己的加注筹码会赢回来） */
+  ok('[V1.20] 加注弃牌分支净收益 = 底池（记账自洽）', (() => {
+    const c = r20.focus.conditional;
+    const i = r20.focus.strategy.findIndex(a => a.type === 'ALLIN');
+    if (!c || i < 0) return false;
+    const pot = 97.5;                    // req.pot = 底池 58.4 + 对手下注 39.1
+    const invest = 70.8, facing = 39.1;
+    const expect = c.foldP * pot + (1 - c.foldP) * (c.eqCont * (pot + invest + (invest - facing)) - invest);
+    return Math.abs(c.evs[i] - expect) < 0.2;
+  })(), (() => { const c = r20.focus.conditional; const i = r20.focus.strategy.findIndex(a => a.type === 'ALLIN'); return 'ev=' + (c && c.evs[i]); })());
+  /* ④ 温度封顶：明显负 EV 的动作不应拿到两成频率 */
+  ok('[V1.20] 弱牌的全下频率接近 0（softmax 温度封顶）',
+    (r20.focus.strategy.find(a => a.type === 'ALLIN')?.freq || 0) < 0.05,
+    'shove=' + ((r20.focus.strategy.find(a => a.type === 'ALLIN')?.freq || 0) * 100).toFixed(2) + '%');
 }
 
 console.log(`\n结果：${pass} 通过 / ${fail} 失败\n`);

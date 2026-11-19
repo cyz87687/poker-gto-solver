@@ -66,7 +66,9 @@ async function main() {
   ok('教学含 TAG/LAG 频率调整', d.lessonSecs.some(s => /TAG/.test(s) && /LAG/.test(s)), (d.lessonSecs[3]||'').slice(0,140));
   ok('教学展示价值/诈唬组合及数量', d.combos.length >= 4 && d.combos.some(x => /QJs/.test(x)), d.combos.slice(0,8).join(' '));
   ok('策略热力图为 13×13 = 169 格', d.stratCells === 169, 'cells=' + d.stratCells);
-  ok('策略格子标注动作字母 F/C/R', /[FCR]/.test(d.stratLetters.join('')) && d.stratLetters.some(x => /^[FCR]\d*$/.test(x)), d.stratLetters.slice(0,12).join(' '));
+  ok('策略格子写入手牌类别（A6s / AK / 66 形式）',
+    d.stratLetters.length > 50 && d.stratLetters.every(x => /^[2-9TJQKA]{1,2}[so]?$/.test(x)),
+    d.stratLetters.slice(0, 12).join(' '));
   ok('策略图例含三色说明', /弃牌/.test(d.stratLegend) && /跟注/.test(d.stratLegend) && /加注/.test(d.stratLegend), d.stratLegend.slice(0,120));
   ok('你的手牌聚焦格有蓝框标记', d.focusRing >= 1, 'focusRing=' + d.focusRing);
 

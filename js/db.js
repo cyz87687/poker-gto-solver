@@ -1,8 +1,8 @@
 /* db.js —— 本地持久化、统计计算、导入导出
  * IndexedDB 为主存储，localStorage 作镜像与降级（file:// / 隐私模式）。
  */
-import { BUILTIN_TAGS, handProfitBB, handClass, serializeHH, actorSide } from './hand.js?v=1.18.3';
-import { CONVERGENCE_TARGETS } from './solver-core.js?v=1.18.3';
+import { BUILTIN_TAGS, handProfitBB, handClass, serializeHH, actorSide } from './hand.js?v=1.20.0';
+import { CONVERGENCE_TARGETS } from './solver-core.js?v=1.20.0';
 
 const DB_NAME = 'poker_gto_review';
 const STORE = 'kv';
