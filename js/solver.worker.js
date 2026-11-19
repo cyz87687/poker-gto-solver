@@ -1,7 +1,7 @@
 /* solver.worker.js —— Web Worker 求解协议（PRD 8.1）
  * 单个 Worker 只处理一个任务；主线程负责排队与通过 terminate 实现取消。
  */
-import { solveCore, previewCore } from './solver-core.js';
+import { solveCore, previewCore } from './solver-core.js?v=1.18.2';
 
 self.onmessage = ev => {
   const msg = ev.data || {};

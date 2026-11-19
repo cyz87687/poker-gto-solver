@@ -1,20 +1,20 @@
 /* app.js —— SPA 主程序：路由、向导录入、求解队列、结果页、台账、统计、牌谱库、备份 */
-import { RANKS, SUITS, SUIT_SYM, cardStr, cardLabel, isRed, parseCardList, parseCard, presetMatrix, emptyMatrix, RANGE_PRESETS, classLabel } from './cards.js';
+import { RANKS, SUITS, SUIT_SYM, cardStr, cardLabel, isRed, parseCardList, parseCard, presetMatrix, emptyMatrix, RANGE_PRESETS, classLabel } from './cards.js?v=1.18.2';
 import {
   STREETS, POS6, POS9, ACTION_TYPES, BUILTIN_TAGS, ARCHETYPES, positionsFor, makeId, defaultHand,
   formatAction, parseHH, validateHand, deriveState, heroDecisionIndices, pendingHeroDecision, serializeHH, handClass, handProfitBB,
   parseActionText, normalizeActionAmounts, solveReadiness, firstToActPostflop,
   stageFromBoard, stageBoardCount, actionFlow
-} from './hand.js';
+} from './hand.js?v=1.18.2';
 import {
   initDB, state, commit, persist, saveDraft, clearDraft, upsertSession, removeSession, upsertHand, removeHand,
   bindHand, upsertJob, findCachedJob, jobCacheKey, escapeHtml,
   computeStats, sessionNet, sessionBuyin, exportJSON, importJSON, exportSessionsCSV, exportHandHH, downloadText
-} from './db.js';
-import { drawCurve, drawBars, renderHeatmapGrid, renderStrategyHeatmap, buildResultImage } from './charts.js';
-import { solveCore, SOLVE_ITER, CONVERGENCE_TARGETS } from './solver-core.js';
-import { solverSizeOptions } from './ui-sizes.js';
-import { rangesForDecision } from './range-by-action.js';
+} from './db.js?v=1.18.2';
+import { drawCurve, drawBars, renderHeatmapGrid, renderStrategyHeatmap, buildResultImage } from './charts.js?v=1.18.2';
+import { solveCore, SOLVE_ITER, CONVERGENCE_TARGETS } from './solver-core.js?v=1.18.2';
+import { solverSizeOptions } from './ui-sizes.js?v=1.18.2';
+import { rangesForDecision } from './range-by-action.js?v=1.18.2';
 
 const $ = s => document.querySelector(s);
 const app = $('#app');
@@ -94,7 +94,7 @@ class SolverQueue {
     const run = () => {
       if (typeof Worker === 'undefined') { this.fallback(item); return; }
       let w;
-      try { w = new Worker(new URL('./solver.worker.js', import.meta.url), { type: 'module' }); }
+      try { w = new Worker(new URL('./solver.worker.js?v=1.18.2', import.meta.url), { type: 'module' }); }
       catch (e) { this.fallback(item); return; }
       item.worker = w;
       w.onerror = ev => this.fail(item, '求解线程异常：' + (ev.message || '未知错误'));
@@ -684,7 +684,12 @@ function liveWhyHtml(r, req, actsIn = null) {
  * 数据全部来自本次求解，不硬编码具体牌。 */
 function riverLessonHtml(r) {
   const L = r && r.lesson;
-  if (!L) return '';
+  if (!L) {
+    // 仅在河牌面对下注时提供决策教学；其他节点给出明确指引，避免误以为功能缺失。
+    return `<div class="river-lesson lesson-empty"><div class="lesson-hd">河牌决策教学<span class="pill">仅河牌提供</span></div>`
+      + `<div class="lesson-sec"><div class="tiny muted">本局教学（价值/诈唬组合拆解、抓诈赔率、TAG/LAG 调整）仅在<b>河牌面对下注</b>的决策点生成；当前决策点不满足条件。`
+      + `可在上方「行动回放与决策点」点击河牌那一步重新求解，即可看到完整教学。</div></div></div>`;
+  }
   const eqPct = L.heroEquity != null ? (L.heroEquity * 100).toFixed(1) : '—';
   const needPct = (L.needPct * 100).toFixed(1);
   const mdfPct = (L.mdf * 100).toFixed(1);
@@ -951,7 +956,7 @@ function runLivePreview(key) {
   }
   finishWorker();
   let w;
-  try { w = new Worker(new URL('./solver.worker.js', import.meta.url), { type: 'module' }); }
+  try { w = new Worker(new URL('./solver.worker.js?v=1.18.2', import.meta.url), { type: 'module' }); }
   catch (e) { finishWorker(); livePreview = { key, status: 'error', result: null, pct: 0, error: '无法启动后台线程' }; render(); return; }
   livePreviewWorker = w;
   w.onmessage = ev => {
