@@ -638,6 +638,23 @@ function liveWhyHtml(r, req, actsIn = null) {
   if (cond) {
     lines.push(`范围条件化：call 面对对手下注范围（${cond.betCombos} 组合，含诈唬），你的权益 ${(cond.eqCall * 100).toFixed(1)}%；`
       + `raise 被跟注则只剩价值范围（${cond.contCombos} 组合），权益降到 ${(cond.eqCont * 100).toFixed(1)}%。`);
+    // V1.17：行动卡 EV 是「范围平均」，手牌级条件 EV 才是你这手牌的真实收益。
+    // 补一行手牌级对比，直接呈现「面对 TAG 加注负 EV / 面对 LAG 加注可盈利」的结论。
+    const st = (r.focus && r.focus.strategy) || [];
+    const evs = cond.evs || [];
+    const callIdx = st.findIndex(a => a.type === 'CALL');
+    const raiseIdx = st.map((a, i) => ({ a, i })).filter(x => x.a.type === 'RAISE' || x.a.type === 'ALLIN');
+    if (callIdx >= 0 && raiseIdx.length) {
+      const callEv = evs[callIdx];
+      const raiseEvs = raiseIdx.map(x => evs[x.i]).filter(v => Number.isFinite(v));
+      if (Number.isFinite(callEv) && raiseEvs.length) {
+        const bestRaise = Math.max(...raiseEvs);
+        const verdict = bestRaise < 0
+          ? '：面对该画像加注是负 EV，造池不划算'
+          : (callEv > bestRaise ? '：跟注收益更高' : '：加注收益更高');
+        lines.push(`手牌级条件 EV：跟注 ${callEv >= 0 ? '+' : ''}${fmt(callEv)} BB，加注最高 ${bestRaise >= 0 ? '+' : ''}${fmt(bestRaise)} BB${verdict}。`);
+      }
+    }
     if (cond.impliedBB > 0) lines.push(`隐含赔率：跟注后击中提升牌的后续街收益约 +${cond.impliedBB.toFixed(1)} BB（已计入 call 的 EV）。`);
   }
   const whyMap = {

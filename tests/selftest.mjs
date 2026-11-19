@@ -10,7 +10,9 @@ import {
   stageFromBoard, stageBoardCount, actionFlow
 } from '../js/hand.js';
 import { solveCore, previewCore, ARCHETYPE_PARAMS, resolveConvergence, CONVERGENCE_TARGETS } from '../js/solver-core.js';
-import { rangeConditionParams, GTO_RANGE_CONDITION } from '../js/archetypes.js';
+import {
+  rangeConditionParams, GTO_RANGE_CONDITION, foldToRaiseByStreet, streetAdjustedRangeCondition
+} from '../js/archetypes.js';
 import {
   initDB, state, commit, upsertSession, upsertHand, sessionNet, computeStats,
   escapeHtml, exportJSON, importJSON, exportSessionsCSV, jobCacheKey
@@ -907,6 +909,96 @@ Flop: [Kh7s2c]  BB bet 8.8`;
     preset: 'fast', mode: 'gto', iterations: 8000
   });
   ok('[V1.16] 翻前路径不产生 conditional（无范围条件化）', !pre16.focus.conditional);
+}
+
+/* ==================== [18] V1.17 翻前/翻后弃牌解耦 + 被跟注范围价值子集 + 跨街极化 ==================== */
+{
+  const HH = `# PokerGTO HH v1
+Game: NLHE
+Stakes: SB=1 BB=2
+Table: 6max
+Hero: BTN [Kc4d]
+Stacks: Hero=100 Villain=100 (BB)
+Preflop:  BTN raise 2.7, BB raise 8.8, BTN call 6.1
+Flop: [Kh7s2c]  BB bet 8.8`;
+  const { hand: h17 } = parseHH(HH);
+  const idx17 = pendingHeroDecision(h17).index;
+  const s17 = deriveState(h17, idx17);
+  const solve17 = (mode, archetype, intensity = 1) => {
+    const rg = rangesForDecision(h17, idx17, { mode, archetype, intensity, stackBB: s17.rem.hero });
+    return solveCore({
+      board: s17.board, heroCards: h17.heroCards, villainCards: [], deadCards: [],
+      heroRange: rg.hero, villainRange: rg.villain,
+      villainRangeLocked: rg.villainLevel > 0, villainRangePreNarrowed: rg.widthInfo != null,
+      pot: s17.pot, stack: s17.stack, facingBet: s17.facingBet,
+      heroOOP: s17.heroOOP, oppChecked: s17.oppChecked,
+      sizes: h17.sizes, allowCheckRaise: h17.allowCheckRaise, preset: 'fast',
+      mode, archetype, intensity, iterations: 20000
+    });
+  };
+  const g17 = solve17('gto', 'tag');
+  const lag17 = solve17('exploit', 'lag');
+  const tag17 = solve17('exploit', 'tag');
+
+  /* 核心 1：TAG 加注全部负 EV，跟注为唯一正 EV 动作（用户「TAG 加注是负 EV」结论） */
+  const condEv = (r, type) => {
+    const i = r.focus.strategy.findIndex(a => a.type === type);
+    return i >= 0 ? r.focus.conditional.evs[i] : null;
+  };
+  const callEvTAG = condEv(tag17, 'CALL');
+  const raiseEvsTAG = tag17.focus.conditional.evs.filter((_, i) =>
+    ['RAISE', 'ALLIN'].includes(tag17.focus.strategy[i].type));
+  ok('[V1.17] TAG 跟注 EV 为正', callEvTAG > 0, callEvTAG + ' BB');
+  ok('[V1.17] TAG 所有加注 EV 为负（造池不再必杀）', raiseEvsTAG.length > 0 && raiseEvsTAG.every(v => v < 0),
+    raiseEvsTAG.join(','));
+  const raiseEvLAG = condEv(lag17, 'RAISE');
+  ok('[V1.17] LAG 小尺度加注 EV 显著优于 TAG（诈唬多+弃牌率高）',
+    raiseEvLAG > Math.max(...raiseEvsTAG) + 5, `lag=${raiseEvLAG} tag=${Math.max(...raiseEvsTAG)}`);
+
+  /* 核心 2：翻前/翻后弃牌方向解耦 —— TAG 翻前高弃/翻后低弃，LAG 相反 */
+  ok('[V1.17] TAG 翻前高弃牌、翻后低弃牌（方向翻转）',
+    foldToRaiseByStreet('tag', false) > 0 && foldToRaiseByStreet('tag', true) < 0,
+    `pre=${foldToRaiseByStreet('tag', false)} post=${foldToRaiseByStreet('tag', true)}`);
+  ok('[V1.17] LAG 翻前低弃牌、翻后高弃牌（方向与 TAG 相反）',
+    foldToRaiseByStreet('lag', false) < 0 && foldToRaiseByStreet('lag', true) > 0,
+    `pre=${foldToRaiseByStreet('lag', false)} post=${foldToRaiseByStreet('lag', true)}`);
+  ok('[V1.17] 翻后 TAG 弃牌修正 < LAG（强范围少弃 vs 空气多弃）',
+    foldToRaiseByStreet('tag', true) < foldToRaiseByStreet('lag', true));
+
+  /* 核心 3：弃牌率与被跟注强度解耦 —— TAG 弃牌率低(foldP 小) 但被跟注范围极强(eqCont 极低) */
+  const cTAG = tag17.focus.conditional, cLAG = lag17.focus.conditional;
+  ok('[V1.17] TAG 翻后弃牌率低（foldP 小，加注打不走）', cTAG.foldP < 0.25, 'foldP=' + cTAG.foldP);
+  ok('[V1.17] LAG 翻后弃牌率高（foldP 大，一加就跑）', cLAG.foldP > 0.6, 'foldP=' + cLAG.foldP);
+  ok('[V1.17] TAG 被跟注范围强度远弱于 LAG（eqCont 更低）', cTAG.eqCont < cLAG.eqCont - 0.1,
+    `tag=${cTAG.eqCont} lag=${cLAG.eqCont}`);
+  ok('[V1.17] TAG 极化度显著高于 LAG（价值/诈唬比）',
+    cTAG.polarization > cLAG.polarization * 3, `tag=${cTAG.polarization} lag=${cLAG.polarization}`);
+
+  /* 核心 4：跨街逐步收窄与极化（连打三条街范围更极化） */
+  const tagRC = rangeConditionParams('exploit', 'tag', 1);
+  const flop = streetAdjustedRangeCondition(tagRC, 3);
+  const turn = streetAdjustedRangeCondition(tagRC, 4);
+  const river = streetAdjustedRangeCondition(tagRC, 5);
+  ok('[V1.17] 诈唬占比逐街递减', flop.betBluffFrac > turn.betBluffFrac && turn.betBluffFrac > river.betBluffFrac,
+    [flop.betBluffFrac, turn.betBluffFrac, river.betBluffFrac].join('>'));
+  ok('[V1.17] 被跟注范围逐街收窄（contTopFrac 递减）',
+    flop.contTopFrac > turn.contTopFrac && turn.contTopFrac > river.contTopFrac,
+    [flop.contTopFrac, turn.contTopFrac, river.contTopFrac].join('>'));
+  ok('[V1.17] 极化度逐街递增（连打三条街更极化）',
+    flop.polarization < turn.polarization && turn.polarization < river.polarization,
+    [flop.polarization, turn.polarization, river.polarization].join('<'));
+  const gtoRC = rangeConditionParams('gto', 'tag', 1);
+  const gtoFlop = streetAdjustedRangeCondition(gtoRC, 3), gtoRiver = streetAdjustedRangeCondition(gtoRC, 5);
+  ok('[V1.17] GTO 跨街不漂移（平衡口径稳定）',
+    near(gtoFlop.polarization, gtoRiver.polarization) && near(gtoFlop.contTopFrac, gtoRiver.contTopFrac));
+
+  /* 核心 5：GTO seed 不漂移（结构改造不得改变 GTO 结果） */
+  ok('[V1.17] GTO eqCall 稳定在 V1.16 口径', near(g17.focus.conditional.eqCall, 0.645, 0.01),
+    'eqCall=' + g17.focus.conditional.eqCall);
+  ok('[V1.17] 结果携带解耦诊断字段', cTAG.foldP != null && cTAG.contTopFrac != null && cTAG.streetSteps != null);
+  ok('[V1.17] continueValueFrac 不被 intensity 放大（保护被跟注范围上限）',
+    near(rangeConditionParams('exploit', 'tag', 1.5).continueValueFrac,
+         rangeConditionParams('exploit', 'tag', 0.5).continueValueFrac));
 }
 
 console.log(`\n结果：${pass} 通过 / ${fail} 失败\n`);

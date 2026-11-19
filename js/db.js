@@ -127,8 +127,8 @@ export function upsertJob(job) {
   });
 }
 /* 求解器版本令牌：停止指标/缓存参数变更时递增，仅使旧缓存不再命中（旧 job 数据保留不动） */
-/* V1.15：对手范围改「绝对宽度」口径（位置对 × 风格 × 结构修正），旧缓存的收窄结果不再适用 */
-const SOLVER_REV = 'v1.16';
+/* V1.17：翻前/翻后弃牌语义解耦 + 被跟注范围改价值子集 + 跨街逐步收窄；旧缓存口径不再适用 */
+const SOLVER_REV = 'v1.17';
 /* V1.14：收敛档位纳入缓存键，不同可剥削度目标不得复用旧结果；老数据缺字段时按 daily 兜底 */
 function cacheParams(hand, params) {
   return [hand.id, params.mode, params.archetype, params.intensity, params.sizes, params.pot, params.stack,

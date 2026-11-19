@@ -9,7 +9,9 @@ import {
   deckExcluding, mulberry32, hashSeed, cardStr, eval7
 } from './cards.js';
 import { applyArchetypeToRange } from './range-by-action.js';
-import { ARCHETYPE_PARAMS, rangeConditionParams } from './archetypes.js';
+import {
+  ARCHETYPE_PARAMS, rangeConditionParams, foldToRaiseByStreet, streetAdjustedRangeCondition
+} from './archetypes.js';
 
 export const N_BUCKETS = 10;
 /* V1.15：画像参数集中到 archetypes.js，solver-core 与范围派生层共用同一份口径 */
@@ -198,6 +200,7 @@ function makeCtx(req, iterations) {
     iterations, NB: N_BUCKETS, E: null, E_call: null, E_raise: null, implied: null,
     nodes: new Map(), actsCache: new Map(),
     archetype: req.archetype || 'tag', intensity: clamp(Number(req.intensity) || 1, 0.5, 1.5),
+    boardLen: (req.board || []).length, // V1.17：翻前/翻后按街选弃牌率
     locked: false, baseNodes: null, cancelled: false
   };
 }
@@ -234,7 +237,13 @@ function lockedStrategy(ctx, state, bucket, acts) {
   if (facing) {
     const fi = acts.findIndex(a => a.type === 'FOLD');
     if (fi >= 0) {
-      const shift = (state.raises > 1 ? A.foldToRaise : A.foldToBet) * k;
+      // V1.17 解耦：翻前面对再加注用 foldToRaise（TAG 高弃/LAG 低弃）；
+      // 翻后用 postflopFoldToRaise（TAG 主动开枪=强范围→少弃，LAG cbet 空气多→多弃）。
+      // 面对首次下注（非再加注）仍用 foldToBet，保持既有翻后下注响应口径。
+      const isPostflop = ctx.boardLen > 0;
+      const shift = isPostflop && state.raises > 1
+        ? foldToRaiseByStreet(ctx.archetype, true, k)
+        : (state.raises > 1 ? A.foldToRaise : A.foldToBet) * k;
       s = redistribute(s, fi, s[fi] + shift);
     }
     const ri = acts.findIndex(a => a.type === 'RAISE' || a.type === 'ALLIN');
@@ -567,20 +576,24 @@ export function solveCore(req, onProgress = () => {}) {
    * 直接影响 CFR 的动作选择。V1.15 提到 128 次（标准误约 4.4%）。 */
   ctx.E = buildEquityMatrix(heroCombos, villainCombos, hb, vb, board, N_BUCKETS, board.length === 0 ? 128 : 96, rng);
 
-  /* V1.16 范围条件化：摊牌收益不再对每条路径用同一套权益。
+  /* V1.17 范围条件化（方案 B 解耦 + 跨街收窄）：摊牌收益不再对每条路径用同一套权益。
    * 桶按 villainEq 等数量划分 → 桶 b 覆盖全局权益分位 [b/NB, (b+1)/NB]，
    * 因此可用「保留区间」精确映射到「桶内该留哪些组合」：
-   *   E_call  = 下注范围 = 高权益价值牌(top betValueFrac) + 低权益诈唬牌(bottom betBluffFrac)
-   *   E_raise = 跟注范围 = 仅高权益价值牌(top callContinueFrac)，诈唬牌已被弃掉
+   *   E_call  = 下注范围 = 高权益价值牌(top betValueFrac) + 低权益诈唬牌(bottom betBluffFrac_跨街衰减)
+   *   E_raise = 被跟注范围 = cbet 价值子集内的更强子集(top contTopFrac = betValueFrac × continueValueFrac)，
+   *             而非 V1.16 的「全范围 top callContinueFrac」——这样「翻后弃牌率」与「被跟注强度」彻底解耦。
+   * 跨街：诈唬占比逐街 ×streetBluffDecay、继续范围逐街 ×streetNarrowPerBet → 范围逐步收窄且更极化。
+   * 弃牌率由 postflopContinueFrac 单独决定（不在权益矩阵里，而在 focusStrategy/节点锁定里）。
    * E_call ≥ E_raise 恒成立（加采样噪声钳制），这就是「诈唬捕捉价值」的数学表达。 */
-  const rangeCond = rangeConditionParams(req.mode, req.archetype, req.intensity);
+  const rangeCondRaw = rangeConditionParams(req.mode, req.archetype, req.intensity);
+  const rangeCond = streetAdjustedRangeCondition(rangeCondRaw, board.length);
   ctx.rangeCondition = rangeCond;
   if (board.length > 0) {
     const eqOf = new Map();
     villainCombos.forEach((c, i) => eqOf.set(c, villainEq[i]));
     const byEq = (x, y) => (eqOf.get(x) ?? 0.5) - (eqOf.get(y) ?? 0.5);
     const intervalsCall = [[0, rangeCond.betBluffFrac], [1 - rangeCond.betValueFrac, 1]];
-    const intervalsRaise = [[1 - rangeCond.callContinueFrac, 1]];
+    const intervalsRaise = [[1 - rangeCond.contTopFrac, 1]];
     const provider = intervals => (bucket, fullList) => {
       const sorted = fullList.slice().sort(byEq);
       const lo = bucket / N_BUCKETS, hi = (bucket + 1) / N_BUCKETS, m = sorted.length;
@@ -777,7 +790,10 @@ function focusStrategy(req, rootNode, acts, combos, hb, eq, pH, eqCtx, ctx) {
     const sorted = vc.map((c, i) => ({ c, eq: veq[i] })).sort((x, y) => y.eq - x.eq);
     const nV = Math.max(1, Math.round(sorted.length * rc.betValueFrac));
     const nB = Math.max(0, Math.round(sorted.length * rc.betBluffFrac));
-    const nCont = Math.max(1, Math.round(sorted.length * rc.callContinueFrac));
+    // V1.17 解耦：contSet 不再用「全范围 top callContinueFrac」，
+    // 而是「cbet 价值子集内的更强子集」= 全范围 top contTopFrac（betValueFrac × continueValueFrac）。
+    // 这样被跟注范围强度与「翻后弃牌率」彻底脱钩：TAG 即使少弃，被跟注也只剩顶级价值牌。
+    const nCont = Math.max(1, Math.round(sorted.length * rc.contTopFrac));
     const betSet = [...sorted.slice(0, nV), ...sorted.slice(-nB)].map(x => [x.c[0], x.c[1], 1]);
     const contSet = sorted.slice(0, nCont).map(x => [x.c[0], x.c[1], 1]);
     const eqCall = betSet.length ? comboEquityVsRange(hc, betSet, board, 2048, mulberry32(777)) : eqFocus;
@@ -811,11 +827,12 @@ function focusStrategy(req, rootNode, acts, combos, hb, eq, pH, eqCtx, ctx) {
         return eqCall * (pot + amt) - amt + implied;
       }
       if (a.type === 'RAISE' || a.type === 'ALLIN') {
-        // 简化：假设对手按 callContinueFrac 比例跟注、其余弃牌
+        // V1.17 解耦：弃牌率只由「翻后继续率」决定（TAG 强范围少弃→foldP 低；LAG 空气多→foldP 高），
+        // 与「被跟注面对多强范围」（eqCont，已用 contTopFrac）互相独立。
         const to = a.raiseTo != null ? a.raiseTo : (a.amount || 0) + facing;
         const invest = to; // Hero 本街总投入（含已投入）
-        const foldP = 1 - rc.callContinueFrac;
-        const callP = rc.callContinueFrac;
+        const callP = rc.postflopContinueFrac != null ? rc.postflopContinueFrac : rc.callContinueFrac;
+        const foldP = 1 - callP;
         const potIfFold = pot + invest; // 对手下注已在 pot，弃牌损失其投入
         const potIfCall = pot + invest * 2;
         // 弃牌赢池需扣掉自己已投入
@@ -833,7 +850,11 @@ function focusStrategy(req, rootNode, acts, combos, hb, eq, pH, eqCtx, ctx) {
     sr = roundedFreqs(w.map(x => x / wsum));
     conditional = { eqCall: Math.round(eqCall * 1000) / 1000, eqCont: Math.round(eqCont * 1000) / 1000,
       impliedBB: Math.round(implied * 100) / 100, bestLabel: acts[best].label, evs: evs.map(v => Math.round(v * 100) / 100),
-      betCombos: betSet.length, contCombos: contSet.length };
+      betCombos: betSet.length, contCombos: contSet.length,
+      // V1.17 解耦诊断字段
+      foldP: Math.round((1 - (rc.postflopContinueFrac != null ? rc.postflopContinueFrac : rc.callContinueFrac)) * 1000) / 1000,
+      contTopFrac: Math.round((rc.contTopFrac || 0) * 1000) / 1000,
+      streetSteps: rc.streetSteps || 0, polarization: Math.round((rc.polarization || 0) * 100) / 100 };
   }
   const out = { cards: hc.map(cardStr), bucket: b, equityVsVillainRange: Math.round(eqFocus * 1000) / 1000,
     strategy: acts.map((a, i) => ({ type: a.type, label: a.label, freq: sr[i] })) };
