@@ -103,6 +103,20 @@ tr:last-child td{border-bottom:0}
 .heat-grid{display:grid;grid-template-columns:repeat(14,minmax(0,1fr));gap:2px;min-width:330px}
 .heat-grid .cell{border-radius:3px;aspect-ratio:1;display:flex;align-items:center;justify-content:center;font-size:9px;min-width:0;overflow:hidden;color:#26303f}
 .heat-grid .hdr{font-size:9px;color:var(--text-3);display:flex;align-items:center;justify-content:center}
+/* ---- V1.18 策略分区热力图 + 河牌教学 ---- */
+.strat-grid .cell{font-weight:700;letter-spacing:-.3px}
+.strat-legend{display:flex;gap:10px;align-items:center;flex-wrap:wrap;font-size:11px;color:var(--text-2)}
+.strat-legend>span{display:inline-flex;gap:4px;align-items:center}
+.strat-legend i{width:16px;height:16px;border-radius:3px;display:inline-flex;align-items:center;justify-content:center;font-style:normal;font-weight:700;font-size:10px}
+.river-lesson{margin-top:12px;border:1px solid var(--line);border-radius:8px;overflow:hidden}
+.river-lesson .lesson-hd{display:flex;justify-content:space-between;align-items:center;padding:9px 12px;background:var(--surface-2);font-weight:600;font-size:13px}
+.river-lesson .lesson-sec{padding:10px 12px;border-top:1px solid var(--line);font-size:12px;line-height:1.7}
+.river-lesson .lesson-sec>b{display:block;margin-bottom:4px;color:var(--accent)}
+.lesson-combo{display:inline-flex;align-items:center;gap:3px;margin:2px 4px 2px 0;padding:2px 6px;border:1px solid var(--line);border-radius:4px;font-size:11px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+.lesson-combo em{font-style:normal;color:var(--text-3);font-size:10px}
+.lesson-tag{display:inline-flex;align-items:center;padding:2px 7px;border-radius:4px;font-size:11px;font-weight:600;margin-right:6px}
+.lesson-tag.val{background:#f6d4d4;color:#b3261e}
+.lesson-tag.bluf{background:#d9e7cf;color:#3a6b22}
 .canvas-box{width:100%;overflow:hidden}
 canvas{max-width:100%;display:block}
 .bar{height:7px;border-radius:5px;background:var(--surface-2);overflow:hidden}

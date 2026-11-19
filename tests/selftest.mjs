@@ -1001,5 +1001,88 @@ Flop: [Kh7s2c]  BB bet 8.8`;
          rangeConditionParams('exploit', 'tag', 0.5).continueValueFrac));
 }
 
+/* ==================== [19] V1.18 河牌教学拆解 + 策略分区热力图 ==================== */
+{
+  const HH = `# PokerGTO HH v1
+Game: NLHE
+Stakes: SB=1 BB=2
+Table: 6max
+Hero: BTN [Kc4d]
+Stacks: Hero=100 Villain=100 (BB)
+Preflop:  BTN raise 2.7, BB raise 8.8, BTN call 6.1
+Flop: [Kh7s2c]  BB bet 8.8, BTN raise 20.4, BB call 11.6
+Turn: [Kh7s2cTs]  BB check, BTN check
+River: [Kh7s2cTsAc]  BB bet 39.1`;
+  const { hand: h18 } = parseHH(HH);
+  const idx = pendingHeroDecision(h18).index;
+  const st = deriveState(h18, idx);
+  ok('[V1.18] 河牌决策点解析正确（index/pot/facing）',
+    idx === 9 && st.street === 'RIVER' && Math.abs(st.pot - 97.5) < 0.2 && Math.abs(st.facingBet - 39.1) < 0.01);
+  const solve18 = (mode, archetype, iters = 20000) => {
+    const rg = rangesForDecision(h18, idx, { mode, archetype, intensity: 1, stackBB: st.rem.hero });
+    return solveCore({
+      board: st.board, heroCards: h18.heroCards, villainCards: [], deadCards: [],
+      heroRange: rg.hero, villainRange: rg.villain,
+      villainRangeLocked: rg.villainLevel > 0, villainRangePreNarrowed: rg.widthInfo != null,
+      pot: st.pot, stack: st.stack, facingBet: st.facingBet,
+      heroOOP: st.heroOOP, oppChecked: st.oppChecked,
+      sizes: h18.sizes, allowCheckRaise: h18.allowCheckRaise, preset: 'fast',
+      mode, archetype, intensity: 1, iterations: iters
+    });
+  };
+  const g18 = solve18('gto', 'tag');
+  const L = g18.lesson;
+  ok('[V1.18] GTO Kc4d 约 95% 跟注（老大给定 95/5 口径）',
+    Math.abs((g18.focus.strategy.find(a => a.type === 'CALL')?.freq || 0) - 0.95) < 0.08,
+    'call=' + ((g18.focus.strategy.find(a => a.type === 'CALL')?.freq || 0) * 100).toFixed(1) + '%');
+  ok('[V1.18] 手牌权益约 30%（老大给定口径）',
+    L && Math.abs(L.heroEquity - 0.30) < 0.06, 'eq=' + (L && L.heroEquity));
+  ok('[V1.18] lesson 赔率/门槛/MDF 自洽',
+    L && near(L.needPct, 39.1 / (97.5 + 39.1), 1e-3) && near(L.mdf, 97.5 / (97.5 + 39.1), 1e-3) && near(L.needPct + L.mdf, 1, 1e-6));
+  ok('[V1.18] 权益高于抓诈门槛 → bluffCatchOk', L && L.bluffCatchOk === true && L.heroEquity >= L.needPct);
+  ok('[V1.18] 价值区/诈唬区按权益切分且价值权益更高',
+    L && L.value.length > 0 && L.bluff.length > 0 && L.value[0].eq > L.bluff[0].eq,
+    'valTop=' + (L && L.value[0].label + ':' + L.value[0].eq) + ' bluffTop=' + (L && L.bluff[0].label + ':' + L.bluff[0].eq));
+  ok('[V1.18] QJs 在 A-K-T 河牌是顺子价值（真实权益 > 0.9），非诈唬',
+    L && L.value.some(g => g.label === 'QJs' && g.eq > 0.9) && !L.bluff.some(g => g.label === 'QJs'));
+  ok('[V1.18] 教学组合带完整花色示例', L && L.value[0].examples.length > 0 && /^[2-9TJQKA][cdhs][2-9TJQKA][cdhs]$/.test(L.value[0].examples[0]), 'ex=' + (L && L.value[0].examples[0]));
+  const sh = g18.heatmap.strategy && g18.heatmap.strategy.hero;
+  ok('[V1.18] 策略热力图为 13×13 且每格有三路频率',
+    sh && sh.length === 13 && sh[0].length === 13 && sh[11][1] && sh[11][1].fold != null && sh[11][1].call != null && sh[11][1].raise != null);
+  const cells = [];
+  for (let i = 0; i < 13; i++) for (let j = 0; j < 13; j++) if (sh && sh[i][j]) cells.push(sh[i][j]);
+  ok('[V1.18] 每格三路频率合计≈100%',
+    cells.every(c => Math.abs(c.fold + c.call + c.raise - 1) < 0.02), 'cells=' + cells.length);
+  ok('[V1.18] 每格标主策略与混合标记', cells.every(c => ['fold', 'call', 'raise'].includes(c.main) && typeof c.mix === 'boolean'));
+  ok('[V1.18] 每格带完整花色组合', cells.every(c => Array.isArray(c.cards) && c.cards.length > 0));
+  ok('[V1.18] 剥削档 lesson/strategy 随画像更新', (() => {
+    const tag18 = solve18('exploit', 'tag'), lag18 = solve18('exploit', 'lag');
+    return tag18.lesson && lag18.lesson
+      && tag18.lesson.polarization > lag18.lesson.polarization
+      && tag18.heatmap.strategy.gto.length === 13;
+  })());
+  // V1.18.1 口径回归：剥削档必须用「对下注范围」权益(eqCall)，不得用全范围权益。
+  // 实测 TAG：全范围 35.3% 虚高，但 eqCall 2.6% < 门槛 28.6% → 应弃牌。
+  ok('[V1.18.1] 剥削 TAG 权益用下注范围口径（非全范围）且判为不达标', (() => {
+    const t = solve18('exploit', 'tag');
+    const L = t.lesson, c = t.focus.conditional;
+    return L && c && L.heroEquity === c.eqCall && L.heroEquityAllRange > L.needPct
+      && L.heroEquity < L.needPct && L.bluffCatchOk === false
+      && (t.focus.strategy.find(a => a.type === 'FOLD')?.freq || 0) > 0.5;
+  })());
+  ok('[V1.18.1] GTO 档两口径一致（下注范围=全范围）', (() => {
+    return L.heroEquityAllRange != null && near(L.heroEquity, L.heroEquityAllRange, 0.02);
+  })());
+  ok('[V1.18] 翻前/翻牌场景不生成 lesson（仅河牌）', (() => {
+    const HH2 = `# PokerGTO HH v1\nGame: NLHE\nStakes: SB=1 BB=2\nTable: 6max\nHero: BTN [Kc4d]\nStacks: Hero=100 Villain=100 (BB)\nPreflop:  BTN raise 2.7, BB raise 8.8, BTN call 6.1\nFlop: [Kh7s2c]  BB bet 8.8`;
+    const h2 = parseHH(HH2).hand, i2 = pendingHeroDecision(h2).index, s2 = deriveState(h2, i2);
+    const rg2 = rangesForDecision(h2, i2, { mode: 'gto', intensity: 1, stackBB: s2.rem.hero });
+    const r2 = solveCore({ board: s2.board, heroCards: h2.heroCards, villainCards: [], deadCards: [], heroRange: rg2.hero, villainRange: rg2.villain,
+      villainRangeLocked: rg2.villainLevel > 0, villainRangePreNarrowed: rg2.widthInfo != null, pot: s2.pot, stack: s2.stack, facingBet: s2.facingBet,
+      heroOOP: s2.heroOOP, oppChecked: s2.oppChecked, sizes: h2.sizes, allowCheckRaise: h2.allowCheckRaise, preset: 'fast', mode: 'gto', iterations: 8000 });
+    return r2.lesson === null;
+  })());
+}
+
 console.log(`\n结果：${pass} 通过 / ${fail} 失败\n`);
 if (fail) process.exit(1);

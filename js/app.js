@@ -11,7 +11,7 @@ import {
   bindHand, upsertJob, findCachedJob, jobCacheKey, escapeHtml,
   computeStats, sessionNet, sessionBuyin, exportJSON, importJSON, exportSessionsCSV, exportHandHH, downloadText
 } from './db.js';
-import { drawCurve, drawBars, renderHeatmapGrid, buildResultImage } from './charts.js';
+import { drawCurve, drawBars, renderHeatmapGrid, renderStrategyHeatmap, buildResultImage } from './charts.js';
 import { solveCore, SOLVE_ITER, CONVERGENCE_TARGETS } from './solver-core.js';
 import { solverSizeOptions } from './ui-sizes.js';
 import { rangesForDecision } from './range-by-action.js';
@@ -677,6 +677,66 @@ function liveWhyHtml(r, req, actsIn = null) {
     lines.push(`风险提示：全下 ${fmt(allinSize, 1)} BB 超过底池 2 倍且属深码，需对手大量弃牌才成立；模型为近似结果，实盘慎用。`);
   }
   return `<div class="live-why"><div class="why-hd">为什么推荐</div>${lines.map(l => `<div class="why-line">${l}</div>`).join('')}</div>`;
+}
+
+/* V1.18 河牌决策教学：基于求解结果里的 lesson（价值/诈唬组合拆解 + 抓诈赔率），
+ * 用教学化语言解释「为什么高频跟注」「组合如何拆」「面对 TAG/LAG 怎么调」。
+ * 数据全部来自本次求解，不硬编码具体牌。 */
+function riverLessonHtml(r) {
+  const L = r && r.lesson;
+  if (!L) return '';
+  const eqPct = L.heroEquity != null ? (L.heroEquity * 100).toFixed(1) : '—';
+  const needPct = (L.needPct * 100).toFixed(1);
+  const mdfPct = (L.mdf * 100).toFixed(1);
+  const fmtGroup = g => `<span class="lesson-combo" title="权益 ${(g.eq * 100).toFixed(1)}%">${esc(g.label)}<em>${g.combos}</em></span>`;
+  const valueHtml = L.value.slice(0, 8).map(fmtGroup).join('');
+  const bluffHtml = L.bluff.slice(0, 8).map(fmtGroup).join('') || '<span class="tiny muted">该画像下诈唬组合极少</span>';
+  // V1.18.1：这里的权益必须是对「对手下注范围」的权益，不是对全范围。
+  // 剥削档下注范围被极化收窄，全范围权益会虚高（如 TAG 全范围 35% 但对下注范围仅 2.6%）。
+  const allPct = L.heroEquityAllRange != null ? (L.heroEquityAllRange * 100).toFixed(1) : null;
+  const scopeNote = (allPct != null && Math.abs(L.heroEquityAllRange - L.heroEquity) > 0.03)
+    ? `注意：这是你对<b>下注范围</b>的权益；你对对手<b>全范围</b>的权益虽有 ${allPct}%，但对手此刻下注的范围已被收窄/极化，不能用全范围权益来抓诈。`
+    : '';
+  const verdict = L.bluffCatchOk
+    ? `你对下注范围的权益 <b>${eqPct}%</b> ≥ 抓诈门槛 <b>${needPct}%</b>，跟注长期为正 EV——这就是 GTO 在此高频跟注的根本原因：`
+      + `对手下注范围里混入了足够多「你赢、他输」的诈唬牌，你只需要赢下其中 ${needPct}% 就能回本。`
+    : `你对下注范围的权益 <b>${eqPct}%</b> &lt; 抓诈门槛 <b>${needPct}%</b>，跟注长期亏 EV，弃牌才是正解。`
+    + (scopeNote ? ` ${scopeNote}` : '');
+  const mdfLine = `最小防守频率 MDF = 底池 / (底池 + 下注) = ${fmt(L.pot, 1)} / (${fmt(L.pot, 1)} + ${fmt(L.bet, 1)}) ≈ <b>${mdfPct}%</b>。`
+    + `GTO 要求你至少用 ${mdfPct}% 的手牌继续（跟注或加注），否则对手可以用任意牌下注就盈利——这是「不能弃太多」的数学下限。`;
+  const streetNote = L.streetSteps > 0
+    ? `本场景已打到河牌（跨街 ${L.streetSteps} 步），诈唬占比逐街衰减到 <b>${(L.bluffFrac * 100).toFixed(1)}%</b>，价值/诈唬极化度 <b>${fmt(L.polarization, 1)}:1</b>；连打三条街后仍在下注的范围，诈唬已所剩无几。`
+    : '';
+  const archLine = (() => {
+    if ((r.mode || 'gto') !== 'exploit') {
+      const caveat = (L.streetSteps || 0) > 0
+        ? '注意：本场景已连打到河牌，跨街极化让诈唬逐街衰减——即便 LAG 到此诈唬也所剩不多，须结合极化度判断、并切「剥削」档核对具体频率。'
+        : '可切到「剥削」档查看具体频率。';
+      return `面对不同画像时的调整：<b>TAG</b> 主动下注的是筛选后的强范围、诈唬极少 → 应<b>提高弃牌频率</b>（少抓诈）；`
+        + `<b>LAG</b> 下注混入大量空气、被加注后弃牌多 → 应<b>提高跟注频率</b>抓诈，甚至可加注施压。${caveat}`;
+    }
+    const A = ARCHETYPES.find(a => a.id === r.archetype);
+    const polar = L.polarization;
+    return `当前画像 <b>${esc(A ? A.name + ' ' + A.tag : (r.archetype || '—'))}</b>：下注范围价值/诈唬极化度 <b>${fmt(polar, 1)}:1</b>、诈唬占比 <b>${(L.bluffFrac * 100).toFixed(1)}%</b>。`
+      + (polar >= 8 ? '诈唬极少，这是典型的 TAG/紧强范围 → 抓诈要谨慎、提高弃牌。'
+        : polar >= 4 ? '诈唬中等，接近平衡 → 按底池赔率中性决策。'
+          : '诈唬充足，范围偏松凶 → 跟注抓诈有价值，可放宽继续范围。');
+  })();
+  return `<div class="river-lesson">
+    <div class="lesson-hd">河牌决策教学 · 抓诈与范围拆解<span class="pill">EV 单位 BB</span></div>
+    <div class="lesson-sec"><b>① 局面与赔率</b>
+      <div>底池 <b>${fmt(L.pot, 1)}</b> BB，对手下注 <b>${fmt(L.bet, 1)}</b> BB，你要跟 <b>${fmt(L.bet, 1)}</b> BB 争夺 <b>${fmt(L.pot + L.bet, 1)}</b> BB。</div>
+      <div>抓诈门槛 = 跟注 / (底池 + 跟注) = ${fmt(L.bet, 1)} / ${fmt(L.pot + L.bet, 1)} ≈ <b>${needPct}%</b>。</div>
+      <div>${verdict}</div>
+    </div>
+    <div class="lesson-sec"><b>② 为什么 GTO 高频跟注（MDF）</b><div>${mdfLine}</div>${streetNote ? `<div>${streetNote}</div>` : ''}</div>
+    <div class="lesson-sec"><b>③ 对手下注范围拆解</b>
+      <div><span class="lesson-tag val">价值区 · ${L.valueCombos} 组合</span>${valueHtml}</div>
+      <div style="margin-top:5px"><span class="lesson-tag bluf">诈唬区 · ${L.bluffCombos} 组合</span>${bluffHtml}</div>
+      <div class="tiny muted" style="margin-top:6px">数字 = 该手牌类别的组合数；按河牌穷举权益从高到低切分：价值区取前 ${(L.valueFrac * 100).toFixed(0)}%、诈唬区取后 ${(L.bluffFrac * 100).toFixed(0)}%。悬停看权益。</div>
+    </div>
+    <div class="lesson-sec"><b>④ 面对 TAG / LAG 的频率调整</b><div>${archLine}</div></div>
+  </div>`;
 }
 /** 实时面板主体：waiting/closed/incomplete 直接给出状态说明；live/review 走求解状态机 */
 function liveBodyHtml(h, street) {
@@ -1349,11 +1409,12 @@ function renderResult(id) {
       ${statLine('树规模', (r.treeSize || '—') + ' 节点')}
     </div>
     ${shown.focus ? `<div class="hr"></div><h3>你的手牌 ${esc(shown.focus.cards.join(' '))}（牌力档 ${shown.focus.bucket}）</h3><div class="small muted">该手牌对 Villain 范围权益约 ${(shown.focus.equityVsVillainRange * 100).toFixed(1)}%；节点策略：${shown.focus.strategy.map(s => `${esc(s.label)} ${(s.freq * 100).toFixed(0)}%`).join(' · ')}</div>` : ''}
+    ${riverLessonHtml(shown)}
   </div>
   ${r.mode === 'exploit' ? renderExploitBlock(r, tab) : ''}
   ${r.gtoActions && tab === 'exploit' ? renderCompareTable(r) : ''}
-  <div class="card heat-card"><h2>范围热力图</h2><div class="grid heat-2col"><div id="heatHero"></div><div id="heatVillain"></div></div>
-    <div class="tiny muted" style="margin-top:8px">按 13×13 手牌类别聚合并按进攻/加注频率着色；颜色越深频率越高。</div></div>
+  <div class="card heat-card"><h2>范围热力图 · Hero 策略分区</h2><div class="grid heat-2col"><div id="heatHero"></div><div id="heatVillain"></div></div>
+    <div class="tiny muted" style="margin-top:8px">按 13×13 手牌类别聚合：F=弃牌 / C=跟注 / R=加注，纯策略标字母、混合策略标频率；悬停看完整花色与三路频率。分组：对角线=对子，右上=同花，左下=非同花。</div></div>
   <div class="card"><h2>路线预览</h2><div class="small muted">选择动作后，采样一张后续公共牌并快解下一条街（不预展开全树）。</div>
     <div class="chips" style="margin-top:8px">${(r.actions || []).map((a, i) => `<button class="chip" data-act="resPreview" data-id="${esc(job.id)}" data-v="${i}">${esc(a.label || a.type)}</button>`).join('')}</div>
     <div id="previewBox" style="margin-top:8px">${previewResult ? renderPreview(previewResult) : ''}</div></div>
@@ -1556,8 +1617,19 @@ function postRender(name, id) {
     if (job && job.status === 'done' && job.result) {
       requestAnimationFrame(() => {
         const a = $('#heatHero'), b = $('#heatVillain');
-        if (a) renderHeatmapGrid(a, job.result.heatmap.hero, { title: 'Hero 均衡进攻范围', legend: '颜色越深 = 下注/加注频率越高' });
-        if (b) renderHeatmapGrid(b, job.result.heatmap.villain, { title: 'Villain 范围与应对象', legend: '颜色越深 = 面对下注时不弃牌倾向越高' });
+        const rj = job.result;
+        const useGto = ui.resTab === 'gto' && rj.gtoActions;
+        const strat = rj.heatmap && rj.heatmap.strategy
+          ? (useGto && rj.heatmap.strategy.gto ? rj.heatmap.strategy.gto : rj.heatmap.strategy.hero) : null;
+        const shownR = useGto ? { ...rj, mode: 'gto' } : rj;
+        if (a && strat && strat.length) {
+          renderStrategyHeatmap(a, strat, {
+            title: `Hero 策略分区 · ${shownR.mode === 'exploit' ? '剥削路线' : '均衡'}`,
+            focusCards: (shownR.focus && shownR.focus.cards) || [],
+            note: '按你手牌类别给出主策略：每个格子来自该类别组合在此决策点的平均策略。混合策略标「动作字母+主策略频率」，纯策略只标字母。重点看蓝框（你的手牌）落在哪个区。'
+          });
+        } else if (a) renderHeatmapGrid(a, rj.heatmap.hero, { title: 'Hero 均衡进攻范围', legend: '颜色越深 = 下注/加注频率越高' });
+        if (b) renderHeatmapGrid(b, rj.heatmap.villain, { title: 'Villain 范围与应对象', legend: '颜色越深 = 面对下注时不弃牌倾向越高' });
       });
     }
   }

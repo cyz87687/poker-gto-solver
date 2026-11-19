@@ -112,6 +112,63 @@ export function renderHeatmapGrid(container, matrix, opts = {}) {
   html += `<div class="legend" style="margin-top:6px"><span>${legend}</span><span><i style="background:${heatColor(0).fill}"></i>低</span><span><i style="background:${heatColor(1).fill}"></i>高</span></div>`;
   container.innerHTML = html;
 }
+
+/* V1.18 策略分区热力图：按 Hero 每个手牌类别的主策略着色 + 标注动作/频率。
+ * 纯策略（main 频率 ≥ 90%）显示动作字母 F/C/R；混合策略显示主动作字母 + 频率（如 C55）。
+ * tooltip 给出完整花色组合与 fold/call/raise 三路频率。下方图例 + 分组说明。 */
+const STRAT_STYLE = {
+  fold:  { bg: '#e8ecf3', fg: '#5a6678', letter: 'F', name: '弃牌' },
+  call:  { bg: '#cfe0fb', fg: '#1c4ea8', letter: 'C', name: '跟注' },
+  raise: { bg: '#f6d4d4', fg: '#b3261e', letter: 'R', name: '加注' }
+};
+export function renderStrategyHeatmap(container, grid, opts = {}) {
+  if (!grid || !grid.length) { container.innerHTML = '<div class="empty tiny">该决策点无翻后策略热力图</div>'; return; }
+  const focusCards = opts.focusCards || [];
+  let html = `<div class="small muted" style="margin-bottom:6px">${opts.title || 'Hero 策略分区'}</div><div class="range-wrap"><div class="heat-grid strat-grid">`;
+  html += '<div class="hdr"></div>';
+  for (let j = 12; j >= 0; j--) html += `<div class="hdr">${RANKS[j]}</div>`;
+  for (let i = 12; i >= 0; i--) {
+    html += `<div class="hdr">${RANKS[i]}</div>`;
+    for (let j = 12; j >= 0; j--) {
+      const cell = grid[i][j];
+      if (!cell) { html += '<div class="cell" style="background:#fafbfd"></div>'; continue; }
+      const st = STRAT_STYLE[cell.main] || STRAT_STYLE.fold;
+      const mainV = cell[cell.main] || 0;
+      // 纯策略显示动作字母，混合策略显示「字母+频率」
+      const label = cell.mix ? `${st.letter}${Math.round(mainV * 100)}` : st.letter;
+      const cards = (cell.cards || []).join(' · ');
+      const tip = `${classLabel(i, j)}｜主策略 ${st.name} ${(mainV * 100).toFixed(0)}%｜弃 ${(cell.fold * 100).toFixed(0)}% / 跟 ${(cell.call * 100).toFixed(0)}% / 加 ${(cell.raise * 100).toFixed(0)}%${cards ? '｜' + cards : ''}`;
+      const isFocus = focusCards.length === 2 && cellMainMatches(cell, focusCards, i, j);
+      const focusRing = isFocus ? ' outline:2px solid #3b5bdb;outline-offset:-2px;font-weight:700;' : '';
+      html += `<div class="cell" style="background:${st.bg};color:${st.fg};${focusRing}" title="${tip.replace(/"/g, '')}">${label}</div>`;
+    }
+  }
+  html += '</div></div>';
+  // 图例：三色策略 + 标注规则
+  html += `<div class="strat-legend" style="margin-top:7px">`
+    + Object.keys(STRAT_STYLE).map(k => { const s = STRAT_STYLE[k]; return `<span><i style="background:${s.bg};color:${s.fg}">${s.letter}</i>${s.name}</span>`; }).join('')
+    + `<span class="tiny muted">字母=纯策略 · 字母+数字=混合策略及频率 · 蓝框=你的手牌</span></div>`;
+  // 分组说明：按牌型区域解释为何这样分
+  if (opts.note) html += `<div class="tiny muted" style="margin-top:6px;line-height:1.5">${opts.note}</div>`;
+  container.innerHTML = html;
+}
+function cellMainMatches(cell, focusCards, i, j) {
+  // focus 手牌落在哪个类别格：用给入的 i/j 与手牌类别索引比对
+  const [a, b] = focusCards;
+  const ra = parseRank(a), rb = parseRank(b);
+  if (ra < 0 || rb < 0) return false;
+  const hi = Math.max(ra, rb), lo = Math.min(ra, rb);
+  const suited = suitOfCard(a) === suitOfCard(b);
+  const [fi, fj] = ra === rb ? [hi, hi] : (suited ? [hi, lo] : [lo, hi]);
+  return fi === i && fj === j;
+}
+function parseRank(card) {
+  if (typeof card !== 'string' || card.length < 2) return -1;
+  return '23456789TJQKA'.indexOf(card[0].toUpperCase());
+}
+function suitOfCard(card) {
+  return typeof card === 'string' ? card[1] : '';
+}
 /** 结果页导出 PNG：生成一张自包含的复盘摘要图 */
 export function buildResultImage(result, hand, meta = {}) {
   const w = 760, h = 560;

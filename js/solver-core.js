@@ -6,7 +6,7 @@
  */
 import {
   matrixToCombos, comboEquityVsRange, bucketize, buildEquityMatrix,
-  deckExcluding, mulberry32, hashSeed, cardStr, eval7
+  deckExcluding, mulberry32, hashSeed, cardStr, eval7, classLabel
 } from './cards.js';
 import { applyArchetypeToRange } from './range-by-action.js';
 import {
@@ -515,6 +515,93 @@ function comboClassIndices(c1, c2) {
   return suited ? [hi, lo] : [lo, hi];
 }
 
+/* V1.18 策略热力图：每个 13×13 类别格输出 fold/call/raise 三路频率，
+ * 直接面对下注的决策节点取 root 策略（与 focus 同源），不再经过「应用到子节点」。
+ * 输出 { hero: [[{fold,call,raise,main,mix,n}]] }，main=主策略动作，mix=是否混合策略。 */
+function strategyHeatFor(ctx, root, combos, buckets, who) {
+  const grid = Array.from({ length: 13 }, () => Array.from({ length: 13 }, () => ({ fold: 0, call: 0, raise: 0, n: 0, cards: [] })));
+  const acts = actionList(root, ctx);
+  const node = ctx.nodes.get(root.key);
+  if (!node || !acts.length) return { hero: [], villain: [] };
+  const foldIdx = acts.findIndex(a => a.type === 'FOLD');
+  const callIdx = acts.findIndex(a => a.type === 'CALL' || a.type === 'CHECK');
+  combos.forEach((c, i) => {
+    const [ci, cj] = comboClassIndices(c[0], c[1]);
+    const b = buckets.bucketOf[i];
+    const s = avgStrat(node, who, b, acts.length);
+    const cell = grid[ci][cj];
+    cell.fold += foldIdx >= 0 ? (s[foldIdx] || 0) : 0;
+    cell.call += callIdx >= 0 ? (s[callIdx] || 0) : 0;
+    for (let k = 0; k < acts.length; k++) {
+      if (acts[k].type === 'BET' || acts[k].type === 'RAISE' || acts[k].type === 'ALLIN') cell.raise += s[k] || 0;
+    }
+    // 完整花色组合（title 里展示，最多 4 个）
+    if (cell.cards.length < 4) cell.cards.push(cardStr(c[0]) + cardStr(c[1]));
+    cell.n++;
+  });
+  const out = Array.from({ length: 13 }, () => new Array(13).fill(null));
+  for (let i = 0; i < 13; i++) for (let j = 0; j < 13; j++) {
+    const c = grid[i][j];
+    if (!c.n) continue;
+    const f = c.fold / c.n, ca = c.call / c.n, r = c.raise / c.n;
+    const arr = [{ k: 'fold', v: f }, { k: 'call', v: ca }, { k: 'raise', v: r }];
+    const top = arr.slice().sort((a, b) => b.v - a.v);
+    out[i][j] = {
+      fold: Math.round(f * 1000) / 1000, call: Math.round(ca * 1000) / 1000, raise: Math.round(r * 1000) / 1000,
+      main: top[0].v > 0.02 ? top[0].k : 'fold', mix: top[0].v < 0.9, n: c.n,
+      cards: c.cards
+    };
+  }
+  return out;
+}
+
+/* V1.18 河牌教学拆解：把 Villain 下注范围按权益排序切成价值区(top betValueFrac)
+ * 与诈唬区(bottom betBluffFrac_跨街衰减)，按手牌类别聚合，展示完整花色组合。
+ * 河牌权益为穷举精确值(villainEq)，可直接用；仅在河牌面对下注时生成。 */
+function buildRiverLesson(req, heroCombos, villainCombos, villainEq, board, rangeCond, pot, facing, focus) {
+  if (board.length !== 5 || !(facing > 0)) return null;
+  const n = villainCombos.length;
+  if (!n) return null;
+  const pairs = villainCombos.map((c, i) => ({ c, eq: villainEq[i] })).sort((a, b) => b.eq - a.eq);
+  const nVal = Math.max(1, Math.round(n * rangeCond.betValueFrac));
+  const nBluff = Math.max(0, Math.round(n * rangeCond.betBluffFrac));
+  const classify = (list, kind) => {
+    const byCls = new Map();
+    list.forEach(x => {
+      const label = classLabel(...comboClassIndices(x.c[0], x.c[1]));
+      if (!byCls.has(label)) byCls.set(label, { label, kind, n: 0, eqSum: 0, examples: [], hi: -Infinity, lo: Infinity });
+      const g = byCls.get(label);
+      g.n++; g.eqSum += x.eq; g.hi = Math.max(g.hi, x.eq); g.lo = Math.min(g.lo, x.eq);
+      if (g.examples.length < 4) g.examples.push(cardStr(x.c[0]) + cardStr(x.c[1]));
+    });
+    return [...byCls.values()].map(g => ({
+      label: g.label, kind: g.kind, combos: g.n,
+      eq: Math.round(g.eqSum / g.n * 1000) / 1000,
+      examples: g.examples
+    })).sort((a, b) => b.eq - a.eq);
+  };
+  const needPct = facing / (pot + facing);          // 底池赔率门槛 = 跟注额 / (底池 + 跟注额)
+  const mdf = pot / (pot + facing);                 // 最小防守频率 = 底池 / (底池 + 下注)
+  // V1.18.1 关键口径：抓诈门槛必须对比「你对 Villain 实际下注范围」的权益（eqCall），
+  // 不是对 Villain 全范围的权益。GTO 档两者巧合相等（下注范围=全范围），剥削档下注范围
+  // 被极化收窄后 eqCall 会远低于全范围权益（实测 TAG 2.6% vs 35.3%），用错口径会误报
+  // 「权益达标应跟注」而实际跟注 −35BB。优先取 conditional.eqCall，回退全范围值。
+  const eqBet = focus && focus.conditional && focus.conditional.eqCall != null ? focus.conditional.eqCall : null;
+  const eqAll = focus && focus.equityVsVillainRange != null ? focus.equityVsVillainRange : null;
+  const eq = eqBet != null ? eqBet : eqAll;
+  return {
+    pot: Math.round(pot * 10) / 10, bet: Math.round(facing * 10) / 10,
+    needPct: Math.round(needPct * 1000) / 1000, mdf: Math.round(mdf * 1000) / 1000,
+    heroEquity: eq, heroEquityAllRange: eqAll, bluffCatchOk: eq != null && eq >= needPct,
+    value: classify(pairs.slice(0, nVal), 'value'),
+    bluff: classify(pairs.slice(-nBluff), 'bluff'),
+    valueCombos: nVal, bluffCombos: nBluff, totalCombos: n,
+    valueFrac: rangeCond.betValueFrac, bluffFrac: rangeCond.betBluffFrac,
+    polarization: Math.round((rangeCond.polarization || 0) * 100) / 100,
+    streetSteps: rangeCond.streetSteps || 0
+  };
+}
+
 /** 主入口：求解一个决策点 */
 export function solveCore(req, onProgress = () => {}) {
   const t0 = Date.now();
@@ -658,6 +745,12 @@ export function solveCore(req, onProgress = () => {}) {
   const userIdx = matchUserAction(rootActs, req.userAction);
   const evLossBB = userIdx >= 0 ? Math.max(0, Math.round((bestEV - gtoEV[userIdx]) * 100) / 100) : null;
 
+  // V1.18：focus 先算一次（教学拆解与结果页共用，避免重复高精度采样）
+  const focusGto = focusStrategy(req, rootNode, rootActs, heroCombos, hb, heroEq, pH, eqCtx, ctx);
+  const lesson = buildRiverLesson(req, heroCombos, villainCombos, villainEq, board,
+    ctx.rangeCondition || {}, req.pot, req.facingBet, focusGto);
+  const stratHero = board.length > 0 ? strategyHeatFor(ctx, root, heroCombos, hb, 'hero') : [];
+
   const base = {
     mode: 'gto', archetype: null, phase, boardCount: board.length,
     quality: conv.quality, targetMbb: conv.targetMbb, converged: gtoRun.converged,
@@ -676,9 +769,13 @@ export function solveCore(req, onProgress = () => {}) {
     ranges: { hero: req.heroRange, villain: villainRange, heroCombos: heroCombos.length, villainCombos: villainCombos.length },
     heatmap: {
       hero: heatFor(ctx, root, heroCombos, hb, villainCombos, vb, 'hero'),
-      villain: heatFor(ctx, root, heroCombos, hb, villainCombos, vb, 'villain')
+      villain: heatFor(ctx, root, heroCombos, hb, villainCombos, vb, 'villain'),
+      // V1.18 策略分区：每格 fold/call/raise 频率 + 主策略/混合标记
+      strategy: { hero: stratHero }
     },
-    focus: focusStrategy(req, rootNode, rootActs, heroCombos, hb, heroEq, pH, eqCtx, ctx),
+    // V1.18 河牌教学拆解（仅河牌面对下注时非空）
+    lesson,
+    focus: focusGto,
     eqEV: Math.round(eqEV * 100) / 100,
     convergence: {
       equilibriumEV: Math.round(eqEV * 100) / 100,
@@ -719,13 +816,21 @@ export function solveCore(req, onProgress = () => {}) {
   const expBest = Math.max(...expEV);
   const expUserLoss = userIdx >= 0 ? Math.max(0, Math.round((expBest - expEV[userIdx]) * 100) / 100) : null;
 
+  // V1.18：剥削档的策略热力图与教学拆解都对齐剥削结果（对手画像已锁定）
+  const expFocus = focusStrategy(req, expRootNode, rootActs, heroCombos, hb, heroEq, pH, eqCtx, exp);
+  const expStratHero = board.length > 0 ? strategyHeatFor(exp, expRoot, heroCombos, hb, 'hero') : [];
+  const expLesson = buildRiverLesson(req, heroCombos, villainCombos, villainEq, board,
+    ctx.rangeCondition || {}, req.pot, req.facingBet, expFocus);
+
   return {
     ...base, mode: 'exploit', archetype: req.archetype, intensity: ctx.intensity,
     exploitGainBB, archetypeLabel: (req.archetype || '').toUpperCase(),
     // 剥削路线本身不是均衡，NashConv 无意义；保留 GTO 基线值供 UI 标注「均衡参考可剥削度」
     exploitabilityMbb, nashConvScope: 'gto-reference',
     // 剥削路线也要给出「你的手牌」条件策略，否则结果页仍显示 GTO 档位
-    focus: focusStrategy(req, expRootNode, rootActs, heroCombos, hb, heroEq, pH, eqCtx, exp) || base.focus,
+    focus: expFocus || base.focus,
+    heatmap: { ...base.heatmap, strategy: { hero: expStratHero, gto: stratHero } },
+    lesson: expLesson,
     iterationsExploit: expItersRun,
     actions: rootActs.map((a, i) => ({ type: a.type, sizeBB: a.raiseTo != null ? a.raiseTo : (a.amount != null ? a.amount : null), label: a.label, freq: expFreqRounded[i], ev: expEV[i] })),
     evLossBB: expUserLoss,
