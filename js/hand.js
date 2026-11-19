@@ -1,7 +1,7 @@
 /* hand.js —— HH v1 牌谱解析、行动流状态机校验、决策点推导、序列化
  * 纯逻辑模块，无 DOM 依赖。
  */
-import { parseCard, parseCardList, cardStr, presetMatrix, emptyMatrix, handClassOfCards } from './cards.js?v=1.20.0';
+import { parseCard, parseCardList, cardStr, presetMatrix, emptyMatrix, handClassOfCards } from './cards.js?v=1.21.0';
 
 export const STREETS = ['PREFLOP', 'FLOP', 'TURN', 'RIVER'];
 export const POS6 = ['UTG', 'MP', 'CO', 'BTN', 'SB', 'BB'];

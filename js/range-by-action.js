@@ -19,8 +19,8 @@
  * 设计约束：仅用于本次求解；不写回 hand.ranges，不改动 IndexedDB 已录数据。
  * Hero 手牌已知，其范围保持原样，避免手牌条件频率因手牌被排除而退化。
  */
-import { emptyMatrix, applyRangeWidth, matrixToCombos } from './cards.js?v=1.20.0';
-import { ARCHETYPE_PARAMS } from './archetypes.js?v=1.20.0';
+import { emptyMatrix, applyRangeWidth, matrixToCombos } from './cards.js?v=1.21.0';
+import { ARCHETYPE_PARAMS } from './archetypes.js?v=1.21.0';
 
 /** 52 choose 2 —— 全范围组合总数，宽度百分比以此为分母 */
 export const TOTAL_COMBOS = 1326;

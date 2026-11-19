@@ -386,6 +386,20 @@ canvas{max-width:100%;display:block}
   .heat-grid .hdr{font-size:clamp(7px,2.4vw,9px)}
 }
 
+/* ===== V1.21 结果页牌面条（当前决策点的公共牌 + 你的手牌） ===== */
+.res-board{display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin-top:8px;background:var(--surface-2);border:1px solid var(--line);border-radius:9px;padding:7px 10px}
+.res-board .rb-lb{font-size:10.5px;font-weight:700;color:var(--text-3);letter-spacing:.6px;white-space:nowrap}
+.res-board .rb-cards{gap:5px}
+.res-board .rb-cards .mini-card{min-width:30px;height:30px;font-size:12.5px;background:#fff;border-color:#dfe4ea;color:#26303f}
+.res-board .rb-cards .mini-card.red{color:#c62828}
+.res-board .rb-sep{width:1px;height:18px;background:var(--line);margin:0 3px}
+@media(max-width:520px){
+  .res-board{gap:5px;padding:6px 8px}
+  .res-board .rb-cards .mini-card{min-width:27px;height:27px;font-size:11.5px}
+  .res-board .rb-sep{display:none}
+  .res-board .rb-lb{font-size:10px}
+}
+
 /* ===== V1.10 决策面板（预览与选项合并） ===== */
 .decision-panel .dp-node{display:flex;flex-wrap:wrap;align-items:center;gap:8px;font-size:12px;color:var(--text-2);background:var(--surface-2);border-radius:8px;padding:8px 10px;margin:2px 0 8px}
 .decision-panel .dp-sub{font-size:11px;font-weight:700;color:var(--text-3);margin:10px 0 4px;letter-spacing:.4px}

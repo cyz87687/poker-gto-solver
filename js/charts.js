@@ -1,7 +1,7 @@
 /* charts.js —— Canvas 图表（无外部依赖，离线可用）
  * 红涨绿跌：盈利红、亏损绿（A 股习惯）
  */
-import { RANKS, classLabel } from './cards.js?v=1.20.0';
+import { RANKS, classLabel } from './cards.js?v=1.21.0';
 
 const UP = '#d92b2b', DOWN = '#128a56', ACCENT = '#3b5bdb';
 const GRID = '#e6e9ef', TEXT = '#5c6675', SURFACE = '#ffffff';

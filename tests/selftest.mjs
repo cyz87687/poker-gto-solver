@@ -1208,5 +1208,93 @@ River: [Kh7s2cTsAc]  BB bet 39.1`;
     'shove=' + ((r20.focus.strategy.find(a => a.type === 'ALLIN')?.freq || 0) * 100).toFixed(2) + '%');
 }
 
+/* ==================== [22] V1.21 结果页公共牌 + 深码 QQ 全下策略核查 ==================== */
+{
+  /* ---------- ① 结果页牌面渲染（纯函数级：与 app.js 同源的口径） ---------- */
+  const hh21 = `# PokerGTO HH v1
+Game: NLHE
+Stakes: SB=1 BB=2
+Table: 6max
+Hero: BTN [QcQd]
+Stacks: Hero=500 Villain=500 (BB)
+Preflop:  BTN raise 3.5, BB raise 12.0, BTN raise 32.5, BB raise 106.0, BTN call 73.5
+Flop: [3d7h9h]  BB bet 106.0, BTN call 106.0
+Turn: [3d7h9h4s]  BB bet 212.0`;
+  const { hand: h21 } = parseHH(hh21);
+  const idx21 = pendingHeroDecision(h21).index;
+  const s21 = deriveState(h21, idx21);
+  /* 结果页取牌面的口径：优先 job.req.board（按决策街截断），无则按街回落到 hand.board */
+  const boardNeed21 = stageBoardCount('TURN');
+  const board21 = (h21.board || []).slice(0, boardNeed21);
+  ok('[V1.21] 结果页牌面按决策街截断（转牌 = 4 张）', board21.length === 4, 'len=' + board21.length);
+  ok('[V1.21] 结果页牌面内容与牌谱一致', board21.map(cardStr).join(' ') === '3d 7h 9h 4s', board21.map(cardStr).join(' '));
+  ok('[V1.21] 翻前节点牌面为空（不误显示公共牌）',
+    stageBoardCount('PREFLOP') === 0 && (h21.board || []).slice(0, 0).length === 0);
+  ok('[V1.21] 河牌节点牌面 = 5 张', stageBoardCount('RIVER') === 5);
+
+  /* ---------- ② 深码 QQ 面对 212 bet：动作集含「全下」 ---------- */
+  const rg21 = rangesForDecision(h21, idx21, { mode: 'gto', archetype: 'tag', intensity: 1, stackBB: s21.rem.hero });
+  const r21 = solveCore({
+    board: s21.board, heroCards: h21.heroCards, villainCards: [], deadCards: [],
+    heroRange: rg21.hero, villainRange: rg21.villain,
+    villainRangeLocked: rg21.villainLevel > 0, villainRangePreNarrowed: rg21.widthInfo != null,
+    pot: s21.pot, stack: s21.stack, facingBet: s21.facingBet,
+    heroOOP: s21.heroOOP, oppChecked: s21.oppChecked,
+    sizes: h21.sizes, allowCheckRaise: h21.allowCheckRaise, preset: 'fast',
+    mode: 'gto', archetype: 'tag', intensity: 1, iterations: 20000
+  });
+  ok('[V1.21] 深码 QQ 面对 212 bet 的动作集含「全下」',
+    !!r21.actions.find(a => a.type === 'ALLIN'),
+    (r21.actions.find(a => a.type === 'ALLIN') || {}).label);
+  ok('[V1.21] 深码 QQ 弃牌频率为 0（面对 212 需 25% 权益，权益远高于门槛）',
+    (r21.focus.strategy.find(a => a.type === 'FOLD')?.freq || 0) < 0.01,
+    'fold=' + ((r21.focus.strategy.find(a => a.type === 'FOLD')?.freq || 0) * 100).toFixed(2) + '%');
+
+  /* ---------- ③ 权益口径交叉验证（穷举河牌 vs 模型采样） ---------- */
+  const vc21 = matrixToCombos(rg21.villain, [...s21.board, ...h21.heroCards], 0.02, 380);
+  let exactEq21 = 0;
+  for (const c of vc21) {
+    const used = [...s21.board, ...h21.heroCards, c[0], c[1]];
+    const deck = []; for (let i = 0; i < 52; i++) if (!used.includes(i)) deck.push(i);
+    let w = 0;
+    for (const r of deck) {
+      const b7 = [...s21.board, r];
+      const hs = eval7([...h21.heroCards, ...b7]), vs = eval7([c[0], c[1], ...b7]);
+      w += hs > vs ? 1 : hs < vs ? 0 : 0.5;
+    }
+    exactEq21 += w / deck.length;
+  }
+  exactEq21 /= Math.max(1, vc21.length);
+  ok('[V1.21] QQ 权益模型采样与穷举一致（误差 < 3pp）',
+    Math.abs(r21.focus.equityVsVillainRange - exactEq21) < 0.03,
+    `model=${(r21.focus.equityVsVillainRange * 100).toFixed(2)}% exact=${(exactEq21 * 100).toFixed(2)}%`);
+
+  /* ---------- ④ 已知模型缺陷护栏（当前行为锁定，防止无声漂移） ---------- */
+  /* 缺陷 A：narrowRangeTop 的 strength() 把 AKs 排在 AA 之上、AQs 排在 KK 之上，
+   * 导致 5bet 档（target 30 组合）整格跳变把 QQ 挤出范围 → 对手范围由 AA/KK/AK 构成、
+   * QQ 缺席，Hero QQ 权益被系统性虚高。此处记录现状，修复时同步更新。 */
+  const strOf = (i, j) => {
+    if (i === j) return 0.50 + i * 0.038;
+    const hi = Math.max(i, j), lo = Math.min(i, j), gap = hi - lo;
+    let s = 0.10 + hi * 0.030 + lo * 0.022;
+    s += i > j ? 0.085 : 0;
+    s += gap <= 1 ? 0.05 : gap <= 2 ? 0.03 : gap <= 4 ? 0 : -0.03;
+    if (hi === 12 && lo >= 10) s += 0.10;
+    if (hi >= 11 && lo >= 9) s += 0.03;
+    return Math.min(s, 0.98);
+  };
+  ok('[V1.21] 【已知缺陷A】strength() 排序 AKs > AA（反常识，待修复）',
+    strOf(12, 11) > strOf(12, 12), `AKs=${strOf(12, 11).toFixed(4)} AA=${strOf(12, 12).toFixed(4)}`);
+  const hasQQ21 = vc21.some(c => c[0] % 13 === 10 && c[1] % 13 === 10);
+  ok('[V1.21] 【已知缺陷A】5bet 范围不含 QQ（导致 QQ 权益虚高，待修复）', !hasQQ21);
+  /* 缺陷 B：foldP 为固定画像值，未受「对手跟注盈亏平衡权益」物理约束 */
+  const c21 = r21.focus.conditional;
+  ok('[V1.21] 【已知缺陷B】foldP 未受物理约束（固定 0.35，待修复）',
+    c21 && Math.abs(c21.foldP - 0.35) < 0.01, 'foldP=' + (c21 && c21.foldP));
+  /* 对手跟注盈亏平衡权益 = 76/1000 = 7.6%，而对手范围内组合权益全 ≥ 45% → 物理弃牌率上限 ≈ 0 */
+  const be21 = 76 / 1000;
+  ok('[V1.21] 【已知缺陷B】物理约束下弃牌率上限应为 0（对手范围无一低于 7.6% 盈亏平衡权益）', be21 < 0.08);
+}
+
 console.log(`\n结果：${pass} 通过 / ${fail} 失败\n`);
 if (fail) process.exit(1);

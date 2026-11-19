@@ -1,21 +1,21 @@
 /* app.js —— SPA 主程序：路由、向导录入、求解队列、结果页、台账、统计、牌谱库、备份 */
-import { RANKS, SUITS, SUIT_SYM, cardStr, cardLabel, isRed, parseCardList, parseCard, presetMatrix, emptyMatrix, RANGE_PRESETS, classLabel } from './cards.js?v=1.20.0';
+import { RANKS, SUITS, SUIT_SYM, cardStr, cardLabel, isRed, parseCardList, parseCard, presetMatrix, emptyMatrix, RANGE_PRESETS, classLabel } from './cards.js?v=1.21.0';
 import {
   STREETS, POS6, POS9, ACTION_TYPES, BUILTIN_TAGS, ARCHETYPES, positionsFor, makeId, defaultHand,
   formatAction, parseHH, validateHand, deriveState, heroDecisionIndices, pendingHeroDecision, serializeHH, handClass, handProfitBB,
   parseActionText, normalizeActionAmounts, solveReadiness, firstToActPostflop,
   stageFromBoard, stageBoardCount, actionFlow
-} from './hand.js?v=1.20.0';
+} from './hand.js?v=1.21.0';
 import {
   initDB, state, commit, persist, saveDraft, clearDraft, upsertSession, removeSession, upsertHand, removeHand,
   bindHand, upsertJob, findCachedJob, jobCacheKey, escapeHtml,
   computeStats, sessionNet, sessionBuyin, exportJSON, importJSON, exportSessionsCSV, exportHandHH, downloadText
-} from './db.js?v=1.20.0';
-import { drawCurve, drawBars, renderHeatmapGrid, renderStrategyHeatmap, buildResultImage } from './charts.js?v=1.20.0';
-import { freqItems, freqOverviewHtml, freqCellHtml, freqActionHtml, comboCodesForClass } from './freq-view.js?v=1.20.0';
-import { solveCore, SOLVE_ITER, CONVERGENCE_TARGETS } from './solver-core.js?v=1.20.0';
-import { solverSizeOptions } from './ui-sizes.js?v=1.20.0';
-import { rangesForDecision } from './range-by-action.js?v=1.20.0';
+} from './db.js?v=1.21.0';
+import { drawCurve, drawBars, renderHeatmapGrid, renderStrategyHeatmap, buildResultImage } from './charts.js?v=1.21.0';
+import { freqItems, freqOverviewHtml, freqCellHtml, freqActionHtml, comboCodesForClass } from './freq-view.js?v=1.21.0';
+import { solveCore, SOLVE_ITER, CONVERGENCE_TARGETS } from './solver-core.js?v=1.21.0';
+import { solverSizeOptions } from './ui-sizes.js?v=1.21.0';
+import { rangesForDecision } from './range-by-action.js?v=1.21.0';
 
 const $ = s => document.querySelector(s);
 const app = $('#app');
@@ -95,7 +95,7 @@ class SolverQueue {
     const run = () => {
       if (typeof Worker === 'undefined') { this.fallback(item); return; }
       let w;
-      try { w = new Worker(new URL('./solver.worker.js?v=1.20.0', import.meta.url), { type: 'module' }); }
+      try { w = new Worker(new URL('./solver.worker.js?v=1.21.0', import.meta.url), { type: 'module' }); }
       catch (e) { this.fallback(item); return; }
       item.worker = w;
       w.onerror = ev => this.fail(item, '求解线程异常：' + (ev.message || '未知错误'));
@@ -957,7 +957,7 @@ function runLivePreview(key) {
   }
   finishWorker();
   let w;
-  try { w = new Worker(new URL('./solver.worker.js?v=1.20.0', import.meta.url), { type: 'module' }); }
+  try { w = new Worker(new URL('./solver.worker.js?v=1.21.0', import.meta.url), { type: 'module' }); }
   catch (e) { finishWorker(); livePreview = { key, status: 'error', result: null, pct: 0, error: '无法启动后台线程' }; render(); return; }
   livePreviewWorker = w;
   w.onmessage = ev => {
@@ -1416,8 +1416,32 @@ function renderResult(id) {
       : '尚未达到目标；迭代已到预算上限，结果为近似趋势，不宜抠混合频率';
   const idxs = heroDecisionIndices(h);
   const pend = pendingHeroDecision(h);
+  /* V1.21 结果页牌面：展示「当前决策点」的公共牌 + 你的手牌。
+   * 数据源优先 job.req.board（按决策街截断，切复盘节点时随 job 变化），老 job 无 req 时按街回落到 hand.board。 */
+  const nodeStage = String(r.decisionNode || '').split('|')[0] || '';
+  const stageForBoard = nodeStage || stageFromBoard((h.board || []).length);
+  const boardNeed = stageBoardCount(stageForBoard);
+  const boardCards = (Array.isArray(job.req && job.req.board) ? job.req.board : (h.board || []).slice(0, boardNeed))
+    .filter(c => c != null);
+  const heroCardsForBoard = (job.req && job.req.heroCards && job.req.heroCards.length ? job.req.heroCards : h.heroCards) || [];
+  const villainCardsForBoard = (job.req && job.req.villainCards) || h.villainCards || [];
+  const boardStripHtml = `
+    <div class="res-board">
+      <span class="rb-lb">${esc(STREET_NAME[stageForBoard] || stageForBoard || '牌面')}</span>
+      <span class="card-row rb-cards">${boardCards.length
+        ? boardCards.map(c => `<span class="mini-card ${isRed(c) ? 'red' : ''}">${esc(cardLabel(c))}</span>`).join('')
+        : '<span class="tiny muted">翻前 · 无公共牌</span>'}</span>
+      <span class="rb-sep"></span>
+      <span class="rb-lb">你的手牌</span>
+      <span class="card-row rb-cards">${heroCardsForBoard.length
+        ? heroCardsForBoard.map(c => `<span class="mini-card ${isRed(c) ? 'red' : ''}">${esc(cardLabel(c))}</span>`).join('')
+        : '<span class="tiny muted">未录入</span>'}</span>
+      ${villainCardsForBoard.length ? `<span class="rb-sep"></span><span class="rb-lb">对手手牌</span>
+        <span class="card-row rb-cards">${villainCardsForBoard.map(c => `<span class="mini-card ${isRed(c) ? 'red' : ''}">${esc(cardLabel(c))}</span>`).join('')}</span>` : ''}
+    </div>`;
   app.innerHTML = `
-  <div class="page-head"><div><h1>求解结果</h1><p class="sub">${esc(r.decisionNode || '')} · 底池 ${fmt(r.pot, 1)} BB · 后手 ${fmt(r.stacks, 1)} BB</p></div>
+  <div class="page-head"><div><h1>求解结果</h1><p class="sub">${esc(r.decisionNode || '')} · 底池 ${fmt(r.pot, 1)} BB · 后手 ${fmt(r.stacks, 1)} BB</p>
+    ${boardStripHtml}</div>
     <div class="row"><button class="btn sm" data-act="resCopy" data-id="${esc(job.id)}">复制牌谱</button><button class="btn sm" data-act="resPNG" data-id="${esc(job.id)}">导出图片</button></div></div>
   ${r.phase === 'preflop' ? '<div class="notice info">翻前近似解：基于起手牌范围对抗权益分档 + 街内 CFR，蒙特卡洛补全 5 张公共牌；未展开翻后博弈树，不等同商用 Solver 的翻前解，仅供范围对抗参考。</div>' : ''}
   <div class="tabs">
