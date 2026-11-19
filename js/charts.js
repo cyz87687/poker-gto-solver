@@ -1,7 +1,7 @@
 /* charts.js —— Canvas 图表（无外部依赖，离线可用）
  * 红涨绿跌：盈利红、亏损绿（A 股习惯）
  */
-import { RANKS, classLabel } from './cards.js?v=1.18.2';
+import { RANKS, classLabel } from './cards.js?v=1.18.3';
 
 const UP = '#d92b2b', DOWN = '#128a56', ACCENT = '#3b5bdb';
 const GRID = '#e6e9ef', TEXT = '#5c6675', SURFACE = '#ffffff';
@@ -140,14 +140,15 @@ export function renderStrategyHeatmap(container, grid, opts = {}) {
       const tip = `${classLabel(i, j)}｜主策略 ${st.name} ${(mainV * 100).toFixed(0)}%｜弃 ${(cell.fold * 100).toFixed(0)}% / 跟 ${(cell.call * 100).toFixed(0)}% / 加 ${(cell.raise * 100).toFixed(0)}%${cards ? '｜' + cards : ''}`;
       const isFocus = focusCards.length === 2 && cellMainMatches(cell, focusCards, i, j);
       const focusRing = isFocus ? ' outline:2px solid #3b5bdb;outline-offset:-2px;font-weight:700;' : '';
-      html += `<div class="cell" style="background:${st.bg};color:${st.fg};${focusRing}" title="${tip.replace(/"/g, '')}">${label}</div>`;
+      // V1.19 点击下钻：格子携带类别索引，由 app.js 全局委托打开花色频率详情
+      html += `<div class="cell" data-act="freqCell" data-i="${i}" data-j="${j}" role="button" tabindex="0" aria-label="${classLabel(i, j)} 频率详情" style="background:${st.bg};color:${st.fg};${focusRing}" title="${tip.replace(/"/g, '')}">${label}</div>`;
     }
   }
   html += '</div></div>';
   // 图例：三色策略 + 标注规则
   html += `<div class="strat-legend" style="margin-top:7px">`
     + Object.keys(STRAT_STYLE).map(k => { const s = STRAT_STYLE[k]; return `<span><i style="background:${s.bg};color:${s.fg}">${s.letter}</i>${s.name}</span>`; }).join('')
-    + `<span class="tiny muted">字母=纯策略 · 字母+数字=混合策略及频率 · 蓝框=你的手牌</span></div>`;
+    + `<span class="tiny muted">字母=纯策略 · 字母+数字=混合策略及频率 · 蓝框=你的手牌 · 点击格子看花色频率</span></div>`;
   // 分组说明：按牌型区域解释为何这样分
   if (opts.note) html += `<div class="tiny muted" style="margin-top:6px;line-height:1.5">${opts.note}</div>`;
   container.innerHTML = html;

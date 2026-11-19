@@ -1,20 +1,21 @@
 /* app.js —— SPA 主程序：路由、向导录入、求解队列、结果页、台账、统计、牌谱库、备份 */
-import { RANKS, SUITS, SUIT_SYM, cardStr, cardLabel, isRed, parseCardList, parseCard, presetMatrix, emptyMatrix, RANGE_PRESETS, classLabel } from './cards.js?v=1.18.2';
+import { RANKS, SUITS, SUIT_SYM, cardStr, cardLabel, isRed, parseCardList, parseCard, presetMatrix, emptyMatrix, RANGE_PRESETS, classLabel } from './cards.js?v=1.18.3';
 import {
   STREETS, POS6, POS9, ACTION_TYPES, BUILTIN_TAGS, ARCHETYPES, positionsFor, makeId, defaultHand,
   formatAction, parseHH, validateHand, deriveState, heroDecisionIndices, pendingHeroDecision, serializeHH, handClass, handProfitBB,
   parseActionText, normalizeActionAmounts, solveReadiness, firstToActPostflop,
   stageFromBoard, stageBoardCount, actionFlow
-} from './hand.js?v=1.18.2';
+} from './hand.js?v=1.18.3';
 import {
   initDB, state, commit, persist, saveDraft, clearDraft, upsertSession, removeSession, upsertHand, removeHand,
   bindHand, upsertJob, findCachedJob, jobCacheKey, escapeHtml,
   computeStats, sessionNet, sessionBuyin, exportJSON, importJSON, exportSessionsCSV, exportHandHH, downloadText
-} from './db.js?v=1.18.2';
-import { drawCurve, drawBars, renderHeatmapGrid, renderStrategyHeatmap, buildResultImage } from './charts.js?v=1.18.2';
-import { solveCore, SOLVE_ITER, CONVERGENCE_TARGETS } from './solver-core.js?v=1.18.2';
-import { solverSizeOptions } from './ui-sizes.js?v=1.18.2';
-import { rangesForDecision } from './range-by-action.js?v=1.18.2';
+} from './db.js?v=1.18.3';
+import { drawCurve, drawBars, renderHeatmapGrid, renderStrategyHeatmap, buildResultImage } from './charts.js?v=1.18.3';
+import { freqItems, freqOverviewHtml, freqCellHtml, freqActionHtml, comboCodesForClass } from './freq-view.js?v=1.18.3';
+import { solveCore, SOLVE_ITER, CONVERGENCE_TARGETS } from './solver-core.js?v=1.18.3';
+import { solverSizeOptions } from './ui-sizes.js?v=1.18.3';
+import { rangesForDecision } from './range-by-action.js?v=1.18.3';
 
 const $ = s => document.querySelector(s);
 const app = $('#app');
@@ -94,7 +95,7 @@ class SolverQueue {
     const run = () => {
       if (typeof Worker === 'undefined') { this.fallback(item); return; }
       let w;
-      try { w = new Worker(new URL('./solver.worker.js?v=1.18.2', import.meta.url), { type: 'module' }); }
+      try { w = new Worker(new URL('./solver.worker.js?v=1.18.3', import.meta.url), { type: 'module' }); }
       catch (e) { this.fallback(item); return; }
       item.worker = w;
       w.onerror = ev => this.fail(item, '求解线程异常：' + (ev.message || '未知错误'));
@@ -956,7 +957,7 @@ function runLivePreview(key) {
   }
   finishWorker();
   let w;
-  try { w = new Worker(new URL('./solver.worker.js?v=1.18.2', import.meta.url), { type: 'module' }); }
+  try { w = new Worker(new URL('./solver.worker.js?v=1.18.3', import.meta.url), { type: 'module' }); }
   catch (e) { finishWorker(); livePreview = { key, status: 'error', result: null, pct: 0, error: '无法启动后台线程' }; render(); return; }
   livePreviewWorker = w;
   w.onmessage = ev => {
@@ -1334,6 +1335,48 @@ function rangeGridHtml(matrix) {
 function statLine(k, v) { return `<div class="stat-line"><span class="muted">${esc(k)}</span><span>${esc(v)}</span></div>`; }
 
 /* ---------------- 结果页 ---------------- */
+/* V1.19 频率下钻：从当前结果/当前 tab 定位到实际显示的那张策略网格 */
+function currentFreqContext() {
+  const job = state().jobs.find(j => j.id === routeInfo().id);
+  if (!job || !job.result) return null;
+  const r = job.result;
+  const useGto = ui.resTab === 'gto' && !!r.gtoActions;
+  const sm = r.heatmap && r.heatmap.strategy;
+  const strat = sm ? (useGto && sm.gto ? sm.gto : sm.hero) : null;
+  return { job, r, useGto, strat, mode: useGto ? 'gto' : r.mode };
+}
+function openFreqCellDetail(i, j) {
+  const ctx = currentFreqContext();
+  if (!ctx || !ctx.strat || !ctx.strat[i]) return;
+  const { job, r, useGto, strat, mode } = ctx;
+  const cell = strat[i][j];
+  if (!cell) return;
+  const blocked = [...(job.req && job.req.board || []), ...((r.focus && r.focus.cards) || [])];
+  const gtoCell = !useGto && r.heatmap && r.heatmap.strategy && r.heatmap.strategy.gto
+    ? (r.heatmap.strategy.gto[i] || [])[j] : null;
+  openModal(freqCellHtml({
+    label: classLabel(i, j), cell, gtoCell,
+    items: freqItems(useGto ? r.gtoActions : r.actions, r.focus),
+    combos: comboCodesForClass(i, j, blocked),
+    focusCode: ((r.focus && r.focus.cards) || []).join(''), mode
+  }));
+}
+function openFreqActionDetail(kind) {
+  const ctx = currentFreqContext();
+  if (!ctx || !ctx.strat) return;
+  const { strat, mode, useGto } = ctx;
+  const rows = [];
+  for (let i = 0; i < 13; i++) for (let j = 0; j < 13; j++) {
+    const cell = strat[i][j];
+    if (!cell || !(cell[kind] > 0.005)) continue;
+    rows.push({ i, j, label: classLabel(i, j), cell, freq: cell[kind] });
+  }
+  rows.sort((a, b) => b.freq - a.freq);
+  openModal(freqActionHtml({
+    kind, rows: rows.slice(0, 60),
+    title: `${mode === 'exploit' ? '剥削路线' : 'GTO 均衡'}${useGto ? ' · GTO 基线' : ''}`
+  }));
+}
 function renderResult(id) {
   const job = state().jobs.find(j => j.id === id);
   if (!job) { app.innerHTML = '<div class="card"><div class="empty">求解任务不存在或已被清理</div></div>'; return; }
@@ -1388,6 +1431,7 @@ function renderResult(id) {
   </div><div class="tiny muted" style="margin-top:6px">点击 Hero 决策可切换复盘节点（重新求解）</div></div>
   <div class="card"><div class="card-title"><h2>${tab === 'exploit' ? '剥削路线输出' : '均衡输出'}</h2><span class="pill">EV 单位：BB</span></div>
     <div class="tiny muted" style="margin-bottom:6px">频率按你的手牌 ${shown.focus ? esc(shown.focus.cards.join(' ')) : ''} 的条件策略；EV 为全范围动作平均值。</div>
+    ${freqOverviewHtml(freqItems(shown.actions), shown.focus ? freqItems(shown.actions, shown.focus) : null)}
     ${deepAllInCaution ? '<div class="notice" style="margin-bottom:8px">风险提示：主推深码超底池全下，需对手大量弃牌才成立；模型为近似结果，实盘慎用。</div>' : ''}
     <div class="table-wrap"><table class="ev-table"><thead><tr><th>动作</th><th class="num">${tab === 'exploit' ? '剥削频率' : '均衡频率'}</th><th class="num">动作 EV</th><th>标签</th></tr></thead><tbody>
       ${shownActions.map((a, i) => {
@@ -1419,7 +1463,7 @@ function renderResult(id) {
   ${r.mode === 'exploit' ? renderExploitBlock(r, tab) : ''}
   ${r.gtoActions && tab === 'exploit' ? renderCompareTable(r) : ''}
   <div class="card heat-card"><h2>范围热力图 · Hero 策略分区</h2><div class="grid heat-2col"><div id="heatHero"></div><div id="heatVillain"></div></div>
-    <div class="tiny muted" style="margin-top:8px">按 13×13 手牌类别聚合：F=弃牌 / C=跟注 / R=加注，纯策略标字母、混合策略标频率；悬停看完整花色与三路频率。分组：对角线=对子，右上=同花，左下=非同花。</div></div>
+    <div class="tiny muted" style="margin-top:8px">按 13×13 手牌类别聚合：F=弃牌 / C=跟注 / R=加注，纯策略标字母、混合策略标频率；悬停看完整花色与三路频率。<b>点击格子</b>弹出花色组合频率详情；点击上方色块查看该动作的手牌类别分布。分组：对角线=对子，右上=同花，左下=非同花。</div></div>
   <div class="card"><h2>路线预览</h2><div class="small muted">选择动作后，采样一张后续公共牌并快解下一条街（不预展开全树）。</div>
     <div class="chips" style="margin-top:8px">${(r.actions || []).map((a, i) => `<button class="chip" data-act="resPreview" data-id="${esc(job.id)}" data-v="${i}">${esc(a.label || a.type)}</button>`).join('')}</div>
     <div id="previewBox" style="margin-top:8px">${previewResult ? renderPreview(previewResult) : ''}</div></div>
@@ -2041,6 +2085,8 @@ function handleAct(act, ds, ev) {
     case 'solve': beginSolve(); break;
     /* 结果页 */
     case 'resTab': ui.resTab = v; render(); break;
+    case 'freqCell': openFreqCellDetail(Number(ds.i), Number(ds.j)); break;
+    case 'freqAction': openFreqActionDetail(v); break;
     case 'resDecision': {
       const job = state().jobs.find(j => j.id === id); const h = state().hands.find(x => x.id === job.handId);
       if (h) submitSolve(h, Number(v)); break;

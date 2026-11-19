@@ -21,6 +21,10 @@ import {
   rangesForDecision, preflopRaiseLevel, raiseLevelFraction, narrowRangeTop, applyArchetypeToRange,
   preflopRaiseTier, archetypeWidth, targetWidthPct, TOTAL_COMBOS
 } from '../js/range-by-action.js';
+import {
+  actionKind, freqItems, comboCodesForClass, comboKey, threeWay,
+  freqOverviewHtml, freqCellHtml, freqActionHtml
+} from '../js/freq-view.js';
 
 let pass = 0, fail = 0;
 function ok(name, cond, extra = '') {
@@ -1082,6 +1086,50 @@ River: [Kh7s2cTsAc]  BB bet 39.1`;
       heroOOP: s2.heroOOP, oppChecked: s2.oppChecked, sizes: h2.sizes, allowCheckRaise: h2.allowCheckRaise, preset: 'fast', mode: 'gto', iterations: 8000 });
     return r2.lesson === null;
   })());
+}
+
+console.log('\n[20] V1.19 图形化频率展示与花色下钻');
+{
+  ok('[V1.19] 动作归类：弃/跟/加三色口径', actionKind({ type: 'FOLD' }) === 'fold'
+    && actionKind({ type: 'CALL' }) === 'call' && actionKind({ type: 'CHECK' }) === 'call'
+    && actionKind({ type: 'BET' }) === 'raise' && actionKind({ type: 'RAISE' }) === 'raise'
+    && actionKind({ type: 'ALLIN' }) === 'raise');
+  const acts = [
+    { type: 'FOLD', label: '弃牌', freq: 0.2 },
+    { type: 'CALL', label: '跟注', freq: 0.3 },
+    { type: 'RAISE', label: '加注至 12.0 BB', freq: 0.5 }
+  ];
+  const focus = { strategy: [{ freq: 0.1 }, { freq: 0.6 }, { freq: 0.3 }] };
+  const items = freqItems(acts, focus);
+  ok('[V1.19] 频率项携带全范围与手牌级双口径', items.length === 3
+    && items[0].freq === 0.2 && items[0].focusFreq === 0.1 && items[2].kind === 'raise');
+  ok('[V1.19] 三路汇总等于 1', (() => { const t = threeWay(items); return near(t.fold + t.call + t.raise, 1); })());
+
+  // 13×13 类别索引：i===j 对子 / i>j 同花 / i<j 非同花
+  ok('[V1.19] 对子 6 种花色组合', comboCodesForClass(12, 12).length === 6);
+  ok('[V1.19] 同花 4 种花色组合', comboCodesForClass(12, 5).length === 4);
+  ok('[V1.19] 非同花 12 种花色组合', comboCodesForClass(5, 12).length === 12);
+  const blocked = comboCodesForClass(12, 5, ['As']);
+  ok('[V1.19] 公共牌阻挡的组合被剔除', blocked.length === 3 && blocked.every(x => !x.startsWith('As')));
+  ok('[V1.19] 组合码忽略牌序便于比对', comboKey('6cAc') === comboKey('Ac6c'));
+
+  const overview = freqOverviewHtml(items, items);
+  ok('[V1.19] 总览含全范围/你的手牌两行 + 可点击色块',
+    /全范围/.test(overview) && /你的手牌/.test(overview) && (overview.match(/data-act="freqAction"/g) || []).length === 6);
+  ok('[V1.19] 总览标注最高/最低与高低差', /最高/.test(overview) && /最低非零/.test(overview) && /高低差/.test(overview));
+
+  const cell = { fold: 0.2, call: 0.55, raise: 0.25, main: 'call', mix: true, n: 4, cards: ['Ac6c', 'Ad6d', 'Ah6h', 'As6s'] };
+  const detail = freqCellHtml({
+    label: 'A6s', cell, items,
+    combos: comboCodesForClass(12, 4, ['Kh', '7s', '2c']),
+    focusCode: 'Ac6c', mode: 'gto'
+  });
+  ok('[V1.19] 花色详情列出完整花色符号', /A♣|A♦|A♥|A♠/.test(detail) && (detail.match(/class="fd-combo[\s"]/g) || []).length === 4);
+  ok('[V1.19] 你的手牌组合有高亮与手牌级频率', /is-focus/.test(detail) && /你的手牌/.test(detail));
+  ok('[V1.19] 剥削档详情并排给出 GTO 基线', /GTO 基线/.test(freqCellHtml({ label: 'A6s', cell, gtoCell: cell, combos: [], mode: 'exploit' })));
+
+  const actionDetail = freqActionHtml({ kind: 'call', rows: [{ i: 12, j: 5, label: 'A6s', cell, freq: 0.55 }], title: 'GTO 均衡' });
+  ok('[V1.19] 动作详情可继续下钻到手牌类别', /data-act="freqCell"/.test(actionDetail) && /A6s/.test(actionDetail));
 }
 
 console.log(`\n结果：${pass} 通过 / ${fail} 失败\n`);

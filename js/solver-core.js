@@ -7,11 +7,11 @@
 import {
   matrixToCombos, comboEquityVsRange, bucketize, buildEquityMatrix,
   deckExcluding, mulberry32, hashSeed, cardStr, eval7, classLabel
-} from './cards.js?v=1.18.2';
-import { applyArchetypeToRange } from './range-by-action.js?v=1.18.2';
+} from './cards.js?v=1.18.3';
+import { applyArchetypeToRange } from './range-by-action.js?v=1.18.3';
 import {
   ARCHETYPE_PARAMS, rangeConditionParams, foldToRaiseByStreet, streetAdjustedRangeCondition
-} from './archetypes.js?v=1.18.2';
+} from './archetypes.js?v=1.18.3';
 
 export const N_BUCKETS = 10;
 /* V1.15：画像参数集中到 archetypes.js，solver-core 与范围派生层共用同一份口径 */
