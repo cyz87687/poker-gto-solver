@@ -278,12 +278,20 @@ export function bucketize(combos, equities, n) {
   }
   return { bucketOf, bounds };
 }
-/** 档位对档位的摊牌权益矩阵 E[bh][bv] */
-export function buildEquityMatrix(heroCombos, villainCombos, hb, vb, board, nBuckets, samplesPerPair, rng) {
+/** 档位对档位的摊牌权益矩阵 E[bh][bv]
+ *  V1.16：opts.subsetForBucket(bucket, fullList) 可为每个 villain 桶提供子集
+ *  （范围条件化：call 用下注范围、raise 被跟注用跟注范围）。子集为空时回退全量。 */
+export function buildEquityMatrix(heroCombos, villainCombos, hb, vb, board, nBuckets, samplesPerPair, rng, opts = {}) {
   const hg = Array.from({ length: nBuckets }, () => []);
   const vg = Array.from({ length: nBuckets }, () => []);
   heroCombos.forEach((c, i) => hg[hb.bucketOf[i]].push(c));
   villainCombos.forEach((c, i) => vg[vb.bucketOf[i]].push(c));
+  if (typeof opts.subsetForBucket === 'function') {
+    for (let b = 0; b < nBuckets; b++) {
+      const sub = opts.subsetForBucket(b, vg[b]);
+      if (sub && sub.length) vg[b] = sub;
+    }
+  }
   const E = Array.from({ length: nBuckets }, () => new Float64Array(nBuckets).fill(0.5));
   const need = Math.max(0, 5 - board.length);
   for (let a = 0; a < nBuckets; a++) for (let b = 0; b < nBuckets; b++) {

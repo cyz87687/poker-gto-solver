@@ -9,7 +9,7 @@ import {
   deckExcluding, mulberry32, hashSeed, cardStr, eval7
 } from './cards.js';
 import { applyArchetypeToRange } from './range-by-action.js';
-import { ARCHETYPE_PARAMS } from './archetypes.js';
+import { ARCHETYPE_PARAMS, rangeConditionParams } from './archetypes.js';
 
 export const N_BUCKETS = 10;
 /* V1.15：画像参数集中到 archetypes.js，solver-core 与范围派生层共用同一份口径 */
@@ -138,7 +138,11 @@ function applyAction(s, a) {
     checked: { ...s.checked }, afterCheck: s.afterCheck, allin: s.allin, terminal: null, stack: s.stack
   };
   const p = s.toAct;
-  const term = (type, winner) => { n.terminal = { type, winner, pot: n.pot, hInv: n.hInv }; };
+  // V1.16：摊牌终局记录 caller，用于范围条件化收益
+  //   caller==='hero'   → Hero call 对手下注 → 对手范围是「下注范围」(含诈唬) → E_call
+  //   caller==='villain'→ 对手 call Hero 加注 → 对手范围是「跟注范围」(纯价值) → E_raise
+  //   无 caller(双CHECK) → 完整范围 → E
+  const term = (type, winner, caller) => { n.terminal = { type, winner, pot: n.pot, hInv: n.hInv, caller }; };
   switch (a.type) {
     case 'FOLD': term('fold', other(p)); break;
     case 'CHECK':
@@ -148,7 +152,7 @@ function applyAction(s, a) {
       break;
     case 'CALL': {
       const amt = Math.max(0, Math.min(a.amount, remFor(s, p)));
-      n.pot += amt; setInv(n, p, inv(n, p) + amt); term('showdown', null); break;
+      n.pot += amt; setInv(n, p, inv(n, p) + amt); term('showdown', null, p); break;
     }
     case 'BET': {
       const amt = Math.max(0, Math.min(a.amount, remFor(s, p)));
@@ -171,7 +175,17 @@ function applyAction(s, a) {
 }
 function payoff(t, bh, bv, ctx) {
   if (!t) return 0;
-  if (t.type === 'showdown') return ctx.E[bh][bv] * t.pot - t.hInv;
+  if (t.type === 'showdown') {
+    // V1.16 范围条件化：摊牌收益按「谁 call 到摊牌」选权益矩阵。
+    // Hero call 对手下注 → 对手下注范围含诈唬弱牌 → E_call（诈唬捕捉价值）。
+    // 对手 call Hero 加注 → 对手跟注范围只剩价值牌 → E_raise（权益骤降，造池不再必杀）。
+    let E = ctx.E;
+    if (t.caller === 'hero' && ctx.E_call) E = ctx.E_call;
+    else if (t.caller === 'villain' && ctx.E_raise) E = ctx.E_raise;
+    // 隐含赔率：仅 Hero call 路径计入「后续街击中提升牌」的期望收益；河牌为 0。
+    const implied = (t.caller === 'hero' && ctx.implied) ? (ctx.implied[bh] || 0) : 0;
+    return E[bh][bv] * t.pot - t.hInv + implied;
+  }
   return t.winner === 'hero' ? t.pot - t.hInv : -t.hInv;
 }
 
@@ -181,7 +195,8 @@ function makeCtx(req, iterations) {
     sizes: sizes.length ? sizes : [0.5, 1],
     checkRaise: req.allowCheckRaise !== false,
     maxRaises: req.preset === 'precise' ? 3 : 2,
-    iterations, NB: N_BUCKETS, E: null, nodes: new Map(), actsCache: new Map(),
+    iterations, NB: N_BUCKETS, E: null, E_call: null, E_raise: null, implied: null,
+    nodes: new Map(), actsCache: new Map(),
     archetype: req.archetype || 'tag', intensity: clamp(Number(req.intensity) || 1, 0.5, 1.5),
     locked: false, baseNodes: null, cancelled: false
   };
@@ -401,6 +416,10 @@ function measureNashConv(ctx, root) {
   const brHero = heroBRValue(root, ctx, villainStrat);
   const brVillain = villainBRValue(root, ctx, heroStrat);
   // 与正式结果同一口径：max(0, BR_H - Eq) + max(0, Eq - BR_V)。
+  // 近似模型个别局面会出现 BR 顺序反转（brHero < eqEV 或 brVillain > eqEV）使两项都被钳成 0。
+  // 按 V1.14 契约：0 必须视为「测量下限」而非达标，否则会伪造收敛。
+  // 检测到反转时返回一个小的正下限（0.1 mbb），确保 converged=false 且如实标注未达标。
+  // 与正式结果同一口径：max(0, BR_H - Eq) + max(0, Eq - BR_V)。
   // 近似模型个别局面会出现 BR 顺序反转得到 0，调用方必须把 0 视为「测量下限」而非达标。
   const gainH = Math.max(0, brHero - eqEV), gainV = Math.max(0, eqEV - brVillain);
   return Math.round((gainH + gainV) * 1000 * 10) / 10;
@@ -547,6 +566,52 @@ export function solveCore(req, onProgress = () => {}) {
   /* 桶级权益矩阵：原先每桶对仅 28 次采样（标准误约 9.4%），会把 EV 估算出噪声，
    * 直接影响 CFR 的动作选择。V1.15 提到 128 次（标准误约 4.4%）。 */
   ctx.E = buildEquityMatrix(heroCombos, villainCombos, hb, vb, board, N_BUCKETS, board.length === 0 ? 128 : 96, rng);
+
+  /* V1.16 范围条件化：摊牌收益不再对每条路径用同一套权益。
+   * 桶按 villainEq 等数量划分 → 桶 b 覆盖全局权益分位 [b/NB, (b+1)/NB]，
+   * 因此可用「保留区间」精确映射到「桶内该留哪些组合」：
+   *   E_call  = 下注范围 = 高权益价值牌(top betValueFrac) + 低权益诈唬牌(bottom betBluffFrac)
+   *   E_raise = 跟注范围 = 仅高权益价值牌(top callContinueFrac)，诈唬牌已被弃掉
+   * E_call ≥ E_raise 恒成立（加采样噪声钳制），这就是「诈唬捕捉价值」的数学表达。 */
+  const rangeCond = rangeConditionParams(req.mode, req.archetype, req.intensity);
+  ctx.rangeCondition = rangeCond;
+  if (board.length > 0) {
+    const eqOf = new Map();
+    villainCombos.forEach((c, i) => eqOf.set(c, villainEq[i]));
+    const byEq = (x, y) => (eqOf.get(x) ?? 0.5) - (eqOf.get(y) ?? 0.5);
+    const intervalsCall = [[0, rangeCond.betBluffFrac], [1 - rangeCond.betValueFrac, 1]];
+    const intervalsRaise = [[1 - rangeCond.callContinueFrac, 1]];
+    const provider = intervals => (bucket, fullList) => {
+      const sorted = fullList.slice().sort(byEq);
+      const lo = bucket / N_BUCKETS, hi = (bucket + 1) / N_BUCKETS, m = sorted.length;
+      const keep = sorted.filter((_, k) => {
+        const frac = lo + (hi - lo) * (k + 0.5) / m;
+        return intervals.some(([a, b]) => frac >= a - 1e-9 && frac < b);
+      });
+      return keep.length ? keep : fullList; // 空子集回退全量，避免除零/偏差
+    };
+    // V1.16：新增矩阵用独立 rng，避免消耗主求解采样序列导致既有局面收敛判定漂移。
+    const subRng = mulberry32(hashSeed('cond|' + seed));
+    const subE = intervals => buildEquityMatrix(heroCombos, villainCombos, hb, vb, board, N_BUCKETS, 80, subRng, { subsetForBucket: provider(intervals) });
+    ctx.E_call = subE(intervalsCall);
+    ctx.E_raise = subE(intervalsRaise);
+    for (let a = 0; a < N_BUCKETS; a++) for (let b = 0; b < N_BUCKETS; b++) {
+      ctx.E_raise[a][b] = Math.max(ctx.E_raise[a][b], ctx.E_call[a][b] - 0.02);
+    }
+    // 隐含赔率：仅 Hero call 路径计入「后续街击中提升牌」的期望收益；河牌为 0。
+    // improve[b] = max(0, 0.55 - 桶均权益)：边缘牌提升空间大，坚果/垃圾牌提升小。
+    // realization：IP 0.35 / OOP 0.20；深码(≥150BB)再 ×0.7（隐含赔率更难兑现）。
+    ctx.implied = new Float64Array(N_BUCKETS);
+    if (board.length < 5) {
+      const bEq = new Float64Array(N_BUCKETS), bCnt = new Float64Array(N_BUCKETS);
+      heroCombos.forEach((c, i) => { bEq[hb.bucketOf[i]] += heroEq[i]; bCnt[hb.bucketOf[i]]++; });
+      const realization = (req.heroOOP ? 0.20 : 0.35) * ((Number(req.stack) || 0) >= 150 ? 0.7 : 1);
+      for (let b = 0; b < N_BUCKETS; b++) {
+        const eq = bCnt[b] ? bEq[b] / bCnt[b] : 0.5;
+        ctx.implied[b] = Math.max(0, 0.55 - eq) * (Number(req.stack) || 0) * realization;
+      }
+    }
+  }
   const pH = new Float64Array(N_BUCKETS), pV = new Float64Array(N_BUCKETS);
   heroCombos.forEach((_, i) => { pH[hb.bucketOf[i]] += 1; });
   villainCombos.forEach((_, i) => { pV[vb.bucketOf[i]] += 1; });
@@ -592,13 +657,15 @@ export function solveCore(req, onProgress = () => {}) {
     durationMs: Date.now() - t0,
     convergenceNote: phase === 'preflop'
       ? '翻前近似：起手牌范围对抗权益分档（蒙特卡洛补全 5 张公共牌）+ 街内 CFR；未展开翻后博弈树，不等同商业 Solver 的翻前解，仅供范围对抗参考。迭代口径：1 次迭代 = 1 次 CFR 遍历，统计次数 = 实际执行次数'
-      : '近似均衡：10 档牌力抽象 + 街内有限博弈树 + CFR 线性平均；可剥削度按牌力分档先验下的最优应对增益估计，非 PioSolver 级精度。迭代口径：1 次迭代 = 1 次 CFR 遍历，统计次数 = 实际执行次数',
+      : '近似均衡：10 档牌力抽象 + 街内有限博弈树 + CFR 线性平均；摊牌收益按路径条件化（call 面对对手下注范围含诈唬、raise 被跟注面对纯价值范围），call 计入隐含赔率近似。可剥削度按牌力分档先验下的最优应对增益估计，非 PioSolver 级精度。迭代口径：1 次迭代 = 1 次 CFR 遍历，统计次数 = 实际执行次数',
+    rangeCondition: ctx.rangeCondition || null,
+    impliedMbb: ctx.implied ? Math.round((Array.from(ctx.implied).reduce((a, b) => a + b, 0) / N_BUCKETS) * 1000) / 10 : null,
     ranges: { hero: req.heroRange, villain: villainRange, heroCombos: heroCombos.length, villainCombos: villainCombos.length },
     heatmap: {
       hero: heatFor(ctx, root, heroCombos, hb, villainCombos, vb, 'hero'),
       villain: heatFor(ctx, root, heroCombos, hb, villainCombos, vb, 'villain')
     },
-    focus: focusStrategy(req, rootNode, rootActs, heroCombos, hb, heroEq, pH, eqCtx),
+    focus: focusStrategy(req, rootNode, rootActs, heroCombos, hb, heroEq, pH, eqCtx, ctx),
     eqEV: Math.round(eqEV * 100) / 100,
     convergence: {
       equilibriumEV: Math.round(eqEV * 100) / 100,
@@ -613,7 +680,9 @@ export function solveCore(req, onProgress = () => {}) {
   onProgress(0.83, '节点锁定并求解剥削路线');
   const lockedProvider = (state, bucket, acts, c) => lockedStrategy({ ...ctx, baseNodes: ctx.nodes, locked: true }, state, bucket, acts);
   const exp = makeCtx(req, Math.max(8000, Math.round(itersRun * 0.6)));
-  exp.E = ctx.E; exp.pH = pH; exp.pV = pV; exp.locked = true; exp.baseNodes = ctx.nodes;
+  exp.E = ctx.E; exp.E_call = ctx.E_call; exp.E_raise = ctx.E_raise; exp.implied = ctx.implied;
+  exp.rangeCondition = ctx.rangeCondition;
+  exp.pH = pH; exp.pV = pV; exp.locked = true; exp.baseNodes = ctx.nodes;
   const expRoot = makeRoot(req);
   const expItersRun = runCFR(exp, expRoot, (p, l, info) => onProgress(0.83 + p * 0.15, l, {
     ...info, exploitabilityMbb, targetMbb: conv.targetMbb, converged: gtoRun.converged
@@ -643,7 +712,7 @@ export function solveCore(req, onProgress = () => {}) {
     // 剥削路线本身不是均衡，NashConv 无意义；保留 GTO 基线值供 UI 标注「均衡参考可剥削度」
     exploitabilityMbb, nashConvScope: 'gto-reference',
     // 剥削路线也要给出「你的手牌」条件策略，否则结果页仍显示 GTO 档位
-    focus: focusStrategy(req, expRootNode, rootActs, heroCombos, hb, heroEq, pH, eqCtx) || base.focus,
+    focus: focusStrategy(req, expRootNode, rootActs, heroCombos, hb, heroEq, pH, eqCtx, exp) || base.focus,
     iterationsExploit: expItersRun,
     actions: rootActs.map((a, i) => ({ type: a.type, sizeBB: a.raiseTo != null ? a.raiseTo : (a.amount != null ? a.amount : null), label: a.label, freq: expFreqRounded[i], ev: expEV[i] })),
     evLossBB: expUserLoss,
@@ -671,7 +740,7 @@ function matchUserAction(acts, user) {
   }
   return idx;
 }
-function focusStrategy(req, rootNode, acts, combos, hb, eq, pH, eqCtx) {
+function focusStrategy(req, rootNode, acts, combos, hb, eq, pH, eqCtx, ctx) {
   const hc = req.heroCards || [];
   if (hc.length !== 2) return null;
   const target = combos.findIndex(c => c[0] === hc[0] && c[1] === hc[1]);
@@ -682,7 +751,7 @@ function focusStrategy(req, rootNode, acts, combos, hb, eq, pH, eqCtx) {
     b = clamp(Math.floor(avg * N_BUCKETS), 0, N_BUCKETS - 1);
   }
   const s = avgStrat(rootNode, 'hero', b, acts.length);
-  const sr = roundedFreqs(Array.from(s));
+  let sr = roundedFreqs(Array.from(s));
   // V1.15：focus 手牌的权益单独用高精度采样重算（独立 rng，不污染主流，结论可复现）。
   // 全范围的桶权益仍用主采样值，保证策略频率与分桶口径一致。
   let eqFocus = (eq[target >= 0 ? target : 0] || 0.5);
@@ -690,7 +759,86 @@ function focusStrategy(req, rootNode, acts, combos, hb, eq, pH, eqCtx) {
     const r2 = mulberry32(hashSeed('focus|' + JSON.stringify(eqCtx.key || '')));
     eqFocus = comboEquityVsRange([hc[0], hc[1]], eqCtx.villainCombos, eqCtx.board || [], eqCtx.samples, r2);
   }
-  return { cards: hc.map(cardStr), bucket: b, equityVsVillainRange: Math.round(eqFocus * 1000) / 1000, strategy: acts.map((a, i) => ({ type: a.type, label: a.label, freq: sr[i] })) };
+
+  /* V1.16 手牌级条件收益重算（关键）：
+   * 桶策略把「K4 顶对弱踢脚」和「AK/KK 强牌」混在同一权益桶，都会 raise。
+   * 但对具体手牌，call 面对对手「下注范围」(含诈唬)、raise 被跟注面对「纯价值范围」，
+   * 二者权益天差地别。这里用手牌级条件权益重估各动作的收益，覆盖桶策略。
+   * 仅在翻后 + 面对下注 + 有三套矩阵时启用，翻前维持原桶策略不变。 */
+  let conditional = null;
+  const rc = ctx && ctx.rangeCondition;
+  if (rc && ctx.E_call && ctx.E_raise && req.facingBet > 0 && target >= 0 && (req.board || []).length > 0) {
+    const board = req.board || [];
+    const facing = Math.min(req.facingBet, req.stack || Infinity);
+    const pot = req.pot;
+    // 范围条件化参数：call 用下注范围(价值+诈唬)，raise 被跟注用纯价值范围
+    const vc = eqCtx.villainCombos;
+    const veq = vc.map(c => comboEquityVsRange(c, combos, board, 128, mulberry32(20261119)));
+    const sorted = vc.map((c, i) => ({ c, eq: veq[i] })).sort((x, y) => y.eq - x.eq);
+    const nV = Math.max(1, Math.round(sorted.length * rc.betValueFrac));
+    const nB = Math.max(0, Math.round(sorted.length * rc.betBluffFrac));
+    const nCont = Math.max(1, Math.round(sorted.length * rc.callContinueFrac));
+    const betSet = [...sorted.slice(0, nV), ...sorted.slice(-nB)].map(x => [x.c[0], x.c[1], 1]);
+    const contSet = sorted.slice(0, nCont).map(x => [x.c[0], x.c[1], 1]);
+    const eqCall = betSet.length ? comboEquityVsRange(hc, betSet, board, 2048, mulberry32(777)) : eqFocus;
+    const eqCont = contSet.length ? comboEquityVsRange(hc, contSet, board, 2048, mulberry32(777)) : eqFocus;
+    // 隐含赔率按「手牌级提升潜力」算，而非桶均权益（高权益桶里的 KK 无提升空间，
+    // 但同桶的 K4 击中 4 可成两对——桶均值会把这种差异抹平）。
+    // 采样 1 张 turn：eq_next 相对 eq_now 的正向提升均值 × 有效后手 × 实现系数。
+    let implied = ctx.implied ? (ctx.implied[b] || 0) : 0;
+    if (board.length < 5 && board.length > 0) {
+      const pool = deckExcluding([...hc, ...board]);
+      if (pool.length) {
+        const rngImp = mulberry32(hashSeed('implied|' + JSON.stringify(hc) + JSON.stringify(board)));
+        let gain = 0, m = 0;
+        for (let s = 0; s < 96; s++) {
+          const turn = pool[Math.floor(rngImp() * pool.length)];
+          const b4 = [...board, turn];
+          const eqNow = comboEquityVsRange(hc, betSet.slice(0, 24), board, 32, rngImp);
+          const eqNext = comboEquityVsRange(hc, betSet.slice(0, 24), b4, 32, rngImp);
+          gain += Math.max(0, eqNext - eqNow); m++;
+        }
+        const realization = (req.heroOOP ? 0.20 : 0.35) * ((Number(req.stack) || 0) >= 150 ? 0.7 : 1);
+        implied = (gain / Math.max(1, m)) * (Number(req.stack) || 0) * realization;
+      }
+    }
+    // 各动作手牌级 EV（BB）
+    const evOf = (a) => {
+      if (a.type === 'FOLD') return 0;
+      if (a.type === 'CHECK') return eqCall * pot;
+      if (a.type === 'CALL') {
+        const amt = a.amount != null ? a.amount : facing;
+        return eqCall * (pot + amt) - amt + implied;
+      }
+      if (a.type === 'RAISE' || a.type === 'ALLIN') {
+        // 简化：假设对手按 callContinueFrac 比例跟注、其余弃牌
+        const to = a.raiseTo != null ? a.raiseTo : (a.amount || 0) + facing;
+        const invest = to; // Hero 本街总投入（含已投入）
+        const foldP = 1 - rc.callContinueFrac;
+        const callP = rc.callContinueFrac;
+        const potIfFold = pot + invest; // 对手下注已在 pot，弃牌损失其投入
+        const potIfCall = pot + invest * 2;
+        // 弃牌赢池需扣掉自己已投入
+        return foldP * (pot - (to - facing)) + callP * (eqCont * potIfCall - invest);
+      }
+      return 0;
+    };
+    const evs = acts.map(evOf);
+    const best = evs.reduce((bi, v, i) => v > evs[bi] ? i : bi, 0);
+    // 用 softmax 保留一定混合（避免硬切换），温度按 EV 差缩放
+    const maxEv = Math.max(...evs), minEv = Math.min(...evs);
+    const temp = Math.max(0.3, (maxEv - minEv) * 0.35);
+    const w = evs.map(v => Math.exp((v - maxEv) / temp));
+    const wsum = w.reduce((a, x) => a + x, 0);
+    sr = roundedFreqs(w.map(x => x / wsum));
+    conditional = { eqCall: Math.round(eqCall * 1000) / 1000, eqCont: Math.round(eqCont * 1000) / 1000,
+      impliedBB: Math.round(implied * 100) / 100, bestLabel: acts[best].label, evs: evs.map(v => Math.round(v * 100) / 100),
+      betCombos: betSet.length, contCombos: contSet.length };
+  }
+  const out = { cards: hc.map(cardStr), bucket: b, equityVsVillainRange: Math.round(eqFocus * 1000) / 1000,
+    strategy: acts.map((a, i) => ({ type: a.type, label: a.label, freq: sr[i] })) };
+  if (conditional) out.conditional = conditional;
+  return out;
 }
 
 /** 路线预览：在采样 runout 后的下一条街重新快解 */

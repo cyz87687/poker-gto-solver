@@ -10,6 +10,7 @@ import {
   stageFromBoard, stageBoardCount, actionFlow
 } from '../js/hand.js';
 import { solveCore, previewCore, ARCHETYPE_PARAMS, resolveConvergence, CONVERGENCE_TARGETS } from '../js/solver-core.js';
+import { rangeConditionParams, GTO_RANGE_CONDITION } from '../js/archetypes.js';
 import {
   initDB, state, commit, upsertSession, upsertHand, sessionNet, computeStats,
   escapeHtml, exportJSON, importJSON, exportSessionsCSV, jobCacheKey
@@ -830,6 +831,82 @@ Preflop:  BTN raise 3.5, BB raise 14.0, BTN raise 40.0, BB raise 132.0`;
   rangesForDecision(h33, idx33, { mode: 'exploit', archetype: 'lag', intensity: 1.5, stackBB: 100 });
   ok('派生范围不写回已存 hand.ranges', JSON.stringify(h33.ranges.villain) === snapBefore);
   ok('画像宽度倍率随强度插值', near(archetypeWidth('lag', 1.5), 1.6, 1e-9) && near(archetypeWidth('tag', 0.5), 0.85, 1e-9));
+}
+
+/* ==================== [17] V1.16 范围条件化收益：隐含赔率 + 诈唬捕捉价值 ==================== */
+{
+  const HH = `# PokerGTO HH v1
+Game: NLHE
+Stakes: SB=1 BB=2
+Table: 6max
+Hero: BTN [Kc4d]
+Stacks: Hero=100 Villain=100 (BB)
+Preflop:  BTN raise 2.7, BB raise 8.8, BTN call 6.1
+Flop: [Kh7s2c]  BB bet 8.8`;
+  const { hand: h16 } = parseHH(HH);
+  const idx16 = pendingHeroDecision(h16).index;
+  const s16 = deriveState(h16, idx16);
+  ok('[V1.16] K4 场景解析零错误且决策点在翻后', idx16 === 4 && s16.street === 'FLOP' && s16.pot > 0);
+
+  const solve16 = (mode, archetype, intensity = 1) => {
+    const rg = rangesForDecision(h16, idx16, { mode, archetype, intensity, stackBB: s16.rem.hero });
+    return solveCore({
+      board: s16.board, heroCards: h16.heroCards, villainCards: [], deadCards: [],
+      heroRange: rg.hero, villainRange: rg.villain,
+      villainRangeLocked: rg.villainLevel > 0, villainRangePreNarrowed: rg.widthInfo != null,
+      pot: s16.pot, stack: s16.stack, facingBet: s16.facingBet,
+      heroOOP: s16.heroOOP, oppChecked: s16.oppChecked,
+      sizes: h16.sizes, allowCheckRaise: h16.allowCheckRaise, preset: 'fast',
+      mode, archetype, intensity, iterations: 20000
+    });
+  };
+  const g16 = solve16('gto', 'tag');
+  const lag16 = solve16('exploit', 'lag');
+  const tag16 = solve16('exploit', 'tag');
+
+  /* 核心：100% raise 消失，call 成为主推荐 */
+  const top16 = r => r.focus.strategy.slice().sort((a, b) => b.freq - a.freq)[0];
+  const callFreq = r => (r.focus.strategy.find(a => a.type === 'CALL') || { freq: 0 }).freq;
+  const maxRaise16 = r => Math.max(0, ...r.focus.strategy.filter(a => a.type === 'RAISE' || a.type === 'ALLIN').map(a => a.freq));
+  ok('[V1.16] GTO 不再 100% raise', maxRaise16(g16) < 0.6, 'maxRaise=' + (maxRaise16(g16) * 100).toFixed(0) + '%');
+  ok('[V1.16] GTO 跟注占比 > 30%', callFreq(g16) > 0.3, (callFreq(g16) * 100).toFixed(0) + '%');
+  ok('[V1.16] GTO 最优动作为跟注', g16.focus.conditional && g16.focus.conditional.bestLabel.includes('跟注'), g16.focus.conditional && g16.focus.conditional.bestLabel);
+
+  /* 范围条件化：call 范围权益 ≥ raise 被跟注范围权益 */
+  for (const [nm, rr] of [['GTO', g16], ['LAG', lag16], ['TAG', tag16]]) {
+    const c = rr.focus.conditional;
+    ok(`[V1.16] ${nm} 存在条件化收益`, !!c && Number.isFinite(c.eqCall) && Number.isFinite(c.eqCont));
+    if (c) {
+      ok(`[V1.16] ${nm} 下注范围权益 ≥ 跟注范围权益`, c.eqCall >= c.eqCont - 0.02, c.eqCall + ' vs ' + c.eqCont);
+      ok(`[V1.16] ${nm} 隐含赔率非负且量级合理`, c.impliedBB >= 0 && c.impliedBB < 10, c.impliedBB + ' BB');
+    }
+  }
+
+  /* 画像分化：TAG 范围更紧 → K4 对下注范围权益显著低于 LAG（诈唬价值） */
+  ok('[V1.16] TAG 下注范围权益 < LAG（紧范围权益更小）',
+    tag16.focus.conditional.eqCall < lag16.focus.conditional.eqCall - 0.05,
+    `tag=${tag16.focus.conditional.eqCall} lag=${lag16.focus.conditional.eqCall}`);
+  ok('[V1.16] LAG 跟注占比 ≥ GTO（诈唬捕捉价值更高）', callFreq(lag16) >= callFreq(g16) - 0.05,
+    `lag=${(callFreq(lag16) * 100).toFixed(0)}% gto=${(callFreq(g16) * 100).toFixed(0)}%`);
+
+  /* 参数源：GTO 固定平衡值，画像各不同，且本次新增字段不改变既有 width */
+  ok('[V1.16] GTO 条件化参数为固定平衡值', near(rangeConditionParams('gto', 'lag').betValueFrac, GTO_RANGE_CONDITION.betValueFrac, 1e-9));
+  ok('[V1.16] LAG 诈唬占比 > TAG', rangeConditionParams('exploit', 'lag').betBluffFrac > rangeConditionParams('exploit', 'tag').betBluffFrac);
+  ok('[V1.16] 既有画像 width 未被改动', near(ARCHETYPE_PARAMS.lag.width, 1.4, 1e-9) && near(ARCHETYPE_PARAMS.tag.width, 0.7, 1e-9));
+  ok('[V1.16] 结果携带条件化口径', g16.rangeCondition && g16.convergenceNote.includes('条件化') && g16.convergenceNote.includes('隐含赔率'));
+
+  /* 翻前不受影响：翻前路径不产生 conditional（范围条件化仅翻后启用） */
+  const pre16Hand = {
+    heroCards: [parseCard('3c'), parseCard('3d')], board: [],
+    positions: { hero: 'BTN', villain: 'BB' }, sizes: [0.33, 0.67, 1]
+  };
+  const pre16 = solveCore({
+    board: [], heroCards: pre16Hand.heroCards, villainCards: [], deadCards: [],
+    heroRange: presetMatrix('btn'), villainRange: presetMatrix('bb'),
+    pot: 15.5, stack: 96.5, facingBet: 8.5, sizes: pre16Hand.sizes, allowCheckRaise: true,
+    preset: 'fast', mode: 'gto', iterations: 8000
+  });
+  ok('[V1.16] 翻前路径不产生 conditional（无范围条件化）', !pre16.focus.conditional);
 }
 
 console.log(`\n结果：${pass} 通过 / ${fail} 失败\n`);

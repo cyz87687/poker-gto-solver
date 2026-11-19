@@ -632,6 +632,14 @@ function liveWhyHtml(r, req, actsIn = null) {
       : (eq >= 50 ? '权益过半，具备下注 / 加注的价值基础' : '权益不足半，更宜过牌控制或小尺度施压');
     lines.push(`你的手牌 ${esc((r.focus.cards || []).join(' '))} 对对手范围权益约 ${eq.toFixed(1)}%，${verdict}。`);
   }
+  // V1.16 范围条件化：区分「call 面对下注范围(含诈唬)」与「raise 被跟注面对纯价值范围」，
+  // 并展示手牌级隐含赔率——这是 K4 顶对弱踢脚不该盲目造池的核心依据。
+  const cond = r.focus && r.focus.conditional;
+  if (cond) {
+    lines.push(`范围条件化：call 面对对手下注范围（${cond.betCombos} 组合，含诈唬），你的权益 ${(cond.eqCall * 100).toFixed(1)}%；`
+      + `raise 被跟注则只剩价值范围（${cond.contCombos} 组合），权益降到 ${(cond.eqCont * 100).toFixed(1)}%。`);
+    if (cond.impliedBB > 0) lines.push(`隐含赔率：跟注后击中提升牌的后续街收益约 +${cond.impliedBB.toFixed(1)} BB（已计入 call 的 EV）。`);
+  }
   const whyMap = {
     FOLD: '权益或赔率不足，弃牌止损是长期最优',
     CHECK: '免费看牌控制底池，同时保留对手下注的诈唬空间',
